@@ -1,0 +1,3 @@
+# Sparse Operations - NPU Implementation
+
+This directory contains NPU implementations of sparse tensor operations.

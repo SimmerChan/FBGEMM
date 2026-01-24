@@ -1,0 +1,3 @@
+# Dispatcher Layer
+
+This directory contains the unified dispatcher that routes operations to the appropriate backend (CUDA/CPU/NPU) based on tensor device type.

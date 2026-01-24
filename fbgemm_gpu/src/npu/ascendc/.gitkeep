@@ -1,0 +1,3 @@
+# AscendC Kernels
+
+This directory contains AscendC kernel implementations. Each operator has its own subdirectory with op_host/ and op_kernel/ subdirectories.

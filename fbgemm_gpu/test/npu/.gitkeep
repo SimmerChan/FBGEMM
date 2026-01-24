@@ -1,0 +1,3 @@
+# NPU Tests
+
+This directory contains NPU-specific tests using unittest + Hypothesis framework.

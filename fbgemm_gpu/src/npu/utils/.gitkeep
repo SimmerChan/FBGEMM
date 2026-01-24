@@ -1,0 +1,3 @@
+# NPU Utility Functions
+
+This directory contains utility functions for NPU operations including device guards, type mapping, and error handling macros.

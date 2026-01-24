@@ -1,0 +1,10 @@
+# NPU Backend Implementation Directory
+
+This directory contains the NPU backend implementation for FBGEMM.
+
+## Structure
+- dispatch/: Unified dispatcher layer
+- sparse_ops/: NPU sparse operator wrappers
+- quantize_ops/: NPU quantization operator wrappers
+- utils/: NPU utility functions
+- ascendc/: AscendC kernel implementations
