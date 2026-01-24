@@ -1,0 +1,5253 @@
+
+╭─── Claude Code v2.1.17 ──────────────────────────────────────────────────────╮
+│                                    │ Tips for getting started                │
+│            Welcome back!           │ Run /init to create a CLAUDE.md file w… │
+│                                    │ ─────────────────────────────────────── │
+│               ▐▛███▜▌              │ Recent activity                         │
+│              ▝▜█████▛▘             │ No recent activity                      │
+│                ▘▘ ▝▝               │                                         │
+│                                    │                                         │
+│   Sonnet 4.5 · API Usage Billing   │                                         │
+│          /home/hsl/FBGEMM          │                                         │
+╰──────────────────────────────────────────────────────────────────────────────╯
+
+  /model to try Opus 4.5
+
+❯ /brainstorming 我想基于FBGEMM_GPU模块适配昇腾AscendC算子。这是算子实现样例，ht
+tps://gitcode.com/Ascend/RecSDK/tree/develop/cust_op。 设计一个详细的适配方案，
+保证FBGEMM_GPU原有的编译流程和代码架构不变，做到解耦。输出适配的方案设计文档。 
+
+● 我来帮你设计FBGEMM_GPU适配昇腾AscendC算子的方案。首先让我了解一下当前项目情况
+  和参考样例。
+
+● 🌐 Z.ai Built-in Tool: webReader
+
+  Input:
+  {"url":"https://gitcode.com/Ascend/RecSDK/tree/develop/cust_op"}
+
+  Executing on server...
+
+● Output:
+  webReader_result_summary: [{"text": {"title": "AtomGit | GitCode -
+  全球开发者的开源社区,开源代码托管平台", "description": "AtomGit |
+  GitCode是面向全球开发者的开源社区,包括原创博客,开源代码托管,代码协作,项目管理
+  等。与开发者社区互动,提升您的研发效率和质量。", "url":
+  "https://gitcode.com/Ascend/RecSDK/tree/develop/cust_op", "content": "AtomGit
+  | GitCode - 全球开发者的开源社区,开源代码托管平台\n\n![Image 1: favicon](h...
+
+● 我注意到网页抓取没有获取到具体的算子实现样例内容。让我先了解当前FBGEMM_GPU项目
+  的结构，以便更好地设计适配方案。
+
+● Explore(探索FBGEMM_GPU项目结构)
+  ⎿  Done (36 tool uses · 0 tokens · 1m 25s)
+
+● 非常好！我已经了解了FBGEMM_GPU的项目结构。这是一个成熟的GPU算子库，已经有对CPU
+  、CUDA和ROCm的多硬件后端支持，并且已经预留了fbgemm_npu_ops/目录。
+
+  我注意到参考样例链接未能获取到具体代码内容。让我逐步了解你的需求：
+
+  第一个问题： 关于昇腾AscendC算子，你是否有本地的样例代码可以分享？或者能否描述
+  一下AscendC算子的以下特点：
+
+  1. 编程接口风格 - AscendC是类似CUDA的C++接口，还是其他风格？
+  2. 编译方式 - AscendC算子是如何编译的？需要特定的编译器吗？
+  3. 算子类型 - 你主要想适配哪类算子？例如：
+    - GEMM/矩阵乘法
+    - Embedding查找
+    - 量化/反量化
+    - 其他特定算子
+
+  如果方便，也可以直接提供AscendC样例的关键代码片段或文件，这样我能更好地理解适
+  配目标。
+
+❯ /home/hsl/RecSDK/cust_op目录是ascendc代码样例，包含了算子kernel实现和接口 
+  注册逻辑、以及编译流程                                                    
+
+● 好的，让我探索一下本地的AscendC代码样例来理解实现模式。
+
+● Explore(探索AscendC算子样例代码)
+  ⎿  Done (30 tool uses · 0 tokens · 1m 53s)
+
+● 非常好！现在我已经了解了AscendC的实现模式：
+
+  AscendC架构特点：
+  - 双层架构：Ascend C Kernel层 + PyTorch适配层
+  - 使用msopgen工具生成框架代码
+  - 通过ACLNN API调用底层kernel
+  - 编译生成.so文件，PyTorch动态加载
+  - 使用TORCH_LIBRARY宏注册算子
+
+  FBGEMM_GPU架构特点：
+  - CMake构建系统，已有CPU/CUDA/ROCm支持
+  - 完善的DISPATCH宏调度系统
+  - 模板化代码生成
+  - 已预留fbgemm_npu_ops/目录
+
+  第二个问题： 关于适配的范围和优先级，你希望：
+
+  A. 全面适配 - 适配FBGEMM_GPU中所有算子到NPU（工作量大，需要逐步实现）
+
+  B. 重点算子适配 - 优先适配关键算子，例如：
+  - Embedding相关算子（推荐系统核心）
+  - 量化/反量化算子
+  - GEMM/矩阵运算
+  - 其他你指定的算子类型
+
+  C. 框架搭建 - 先建立完整的适配框架和编译流程，后续逐步添加具体算子实现
+
+  D. 其他方案 - 你有其他特定的适配范围考虑
+
+  请选择或描述你的优先级考虑。
+
+❯ <ide_opened_file>The user opened the file /home/hsl/FBGEMM/LICENSE in the 
+  IDE. This may or may not be related to the current                        
+  task.</ide_opened_file>                                                   
+
+❯ 优先实现C，把整体框架搭建起来。 
+
+● 好的，选择C方案 -
+  先搭建完整框架。这是一个很好的策略，可以建立稳固的基础后再逐步添加算子。
+
+  第三个问题： 关于NPU算子的编译流程集成方式，FBGEMM_GPU使用CMake构建系统，而Asc
+  endC样例使用独立的run.sh和build.sh脚本。你希望：
+
+  A. 完全独立编译（推荐） -
+  NPU算子保持独立的编译流程，生成独立的.so文件，在运行时动态加载。这种方式：
+  - 优点：完全解耦，不破坏FBGEMM原有编译流程，AscendC工具链独立
+  - 实现：在fbgemm_npu_ops/下建立独立的CMake构建系统
+
+  B. 集成到主CMake -
+  将NPU算子编译集成到FBGEMM_GPU的主CMakeLists.txt中。这种方式：
+  - 优点：统一构建，一次编译所有后端
+  - 缺点：需要修改主CMake逻辑，引入AscendC工具链依赖
+
+  C. 混合方式 - 提供两种编译选项：
+  - 开发阶段：独立编译快速迭代
+  - 发布阶段：可集成到主构建系统
+
+  你倾向于哪种方式？
+
+❯ 倾向于B。然后fbgemm_npu_ops目录是我自己创建的，不是项目本身就存在的目录， 
+  我已经删除了，忘记这个目录的存在。方案不用考虑这个目录。                  
+
+● 好的，明确了：使用B方案集成到主CMake，不考虑fbgemm_npu_ops目录。
+
+  第四个问题： 关于NPU算子的代码组织方式，参考FBGEMM_GPU现有的结构（如sparse_ops
+  /、quantize_ops/等目录）和AscendC样例的双层架构（Ascend C Kernel +
+  PyTorch适配层），你希望：
+
+  A. 分离式架构（推荐） -
+  在fbgemm_gpu/src/下创建独立的NPU算子目录，每个算子包含：
+  - ascendc/ - Ascend C kernel实现（.cpp）
+  - torch/ - PyTorch适配层实现
+  - 类似现有的split_embeddings_cache/结构
+
+  B. 内嵌式架构 - 在现有算子目录内添加NPU实现：
+  - 例如在sparse_ops/下添加sparse_ops_npu.cu
+  - 通过宏条件编译区分CUDA/NPU
+
+  C. 扁平化架构 - 在fbgemm_gpu/src/下创建统一的npu/目录：
+  - npu/kernels/ - 所有NPU kernel
+  - npu/pytorch/ - 所有PyTorch适配
+  - 按功能模块组织子目录
+
+  你倾向于哪种代码组织方式？这会影响后续的编译配置和代码结构。
+
+❯ 你觉得哪种方式更适合FBGEMM项目的硬件解耦和软件演进，需要考虑项目owner更愿 
+  意哪种方式让我合入。FBGEMM项目和昇腾算子适配是两个独立的团队              
+
+● 基于对FBGEMM项目现有架构的分析，我建议采用 C. 扁平化架构，原因如下：
+
+  为什么C方案最容易被接受：
+
+  1. 符合FBGEMM的演进模式
+  - ROCm是通过HIPify工具链自动转换，没有单独的目录
+  - 但NPU无法通过工具链自动转换（AscendC是不同的编程模型）
+  - 扁平化的npu/目录明确表明"这是需要单独维护的硬件后端"
+
+  2. 最小化侵入性
+  - 不修改现有CUDA/CPU代码文件（避免大量merge冲突）
+  - 通过调度宏在运行时路由到NPU实现
+  - 现有开发者可以完全忽略NPU代码
+
+  3. 便于独立团队协作
+  - 昇腾团队拥有独立的npu/目录，自主开发
+  - FBGEMM owner只需review调度逻辑的修改
+  - 代码边界清晰，责任划分明确
+
+  4. 与现有模式兼容
+  - 延续src/目录下按功能模块的组织方式
+  - 通过USE_NPU宏进行条件编译（类似USE_ROCM）
+
+  这个方向可以吗？我可以继续深入设计具体的技术架构。
+
+❯ 那就采用方案C 
+
+● 好的，采用C方案 - 扁平化架构。
+
+  第五个问题： 关于算子接口的注册和路由方式，参考AscendC样例使用torch.ops.mxrec
+  命名空间，而FBGEMM使用fbgemm命名空间。你希望：
+
+  A. 扩展fbgemm命名空间（推荐） - 在现有的fbgemm命名空间下注册NPU实现：
+  TORCH_LIBRARY_IMPL(fbgemm, PrivateUse1, m) {
+      m.impl("invert_permute", &invert_permute_npu);
+  }
+     PyTorch代码中统一使用：torch.ops.fbgemm.xxx()
+
+  B. 独立命名空间 - 创建独立的命名空间（如fbgemm_npu或mxrec）：
+  TORCH_LIBRARY_IMPL(fbgemm_npu, PrivateUse1, m) {
+      m.impl("invert_permute", &invert_permute_npu);
+  }
+     调用时需要区分：torch.ops.fbgemm_npu.xxx()
+
+  C. 混合方式 - 提供两种接口，既有fbgemm也有独立命名空间，便于迁移
+
+  这会影响上层PyTorch代码的调用方式和API一致性。你倾向于哪种？
+
+❯ 方案A. 扩展fbgemm命名空间 
+
+● 好的，扩展fbgemm命名空间，这样上层PyTorch代码可以无缝切换硬件后端。
+
+  第六个问题： 关于硬件后端的选择和调度机制，FBGEMM目前使用设备类型来区分CPU/GPU
+  。对于NPU（torch_npu使用PrivateUse1设备类型），你希望：
+
+  A. 自动设备检测（推荐） - 根据张量所在设备自动选择后端：
+  # 张量在NPU上自动使用NPU算子
+  x_npu = tensor.to('npu:0')
+  torch.ops.fbgemm.some_op(x_npu)  # 自动路由到NPU实现
+
+  B. 显式环境变量控制 - 通过环境变量强制选择后端：
+  export FBGEMM_BACKEND=npu  # 优先使用NPU
+     便于调试和性能对比
+
+  C. 混合方式 - 默认自动检测，支持环境变量覆盖：
+  - 优先级：环境变量 > 设备类型 > 默认后端
+  - 便于灵活切换和A/B测试
+
+  你倾向于哪种调度策略？
+
+❯ 方案A，自动设备检测 
+
+● 好的，自动设备检测，这样用户无需关心底层硬件。
+
+  第七个问题： 关于NPU工具链的依赖管理和编译配置，AscendC需要特定的工具链（如CAN
+  N、msopgen、AscendC编译器），但不是所有开发者都会安装这些。你希望：
+
+  A. 可选依赖（推荐） - NPU作为可选的后端，默认关闭：
+  option(USE_NPU "Build with Ascend NPU support" OFF)
+  - 只有显式开启才检查NPU工具链
+  - 不影响不使用NPU的开发者
+
+  B. 自动检测 - CMake自动检测系统是否有NPU工具链：
+  find_package(CANN QUIET)
+  if(CANN_FOUND)
+      set(USE_NPU ON)
+  endif()
+  - 有工具链就自动启用
+
+  C. 预配置场景 - 提供多种预设配置：
+  cmake -DCMAKE_BUILD_TYPE=Release -DUSE_NPU=ON -DCANN_PATH=/usr/local/Ascend
+  - 文档中提供标准配置模板
+
+  这会影响其他开发者的使用体验。你倾向于哪种？
+
+❯ 方案A，可选依赖 
+
+● 好的，NPU作为可选依赖，默认关闭。
+
+  第八个问题： 关于算子实现的选择逻辑，FBGEMM现有CUDA算子使用DISPATCH宏进行类型
+  调度。对于NPU，你希望：
+
+  A. 独立的NPU算子入口（推荐） - NPU算子有独立的实现函数，在Python层选择：
+  // fbgemm_gpu/src/npu/sparse_ops/invert_permute.cpp
+  Tensor invert_permute_npu(const Tensor& x) {
+      // NPU专用实现
+  }
+
+  // Python层
+  def invert_permute(x):
+      if x.is_npu:
+          return torch.ops.fbgemm.invert_permute_npu(x)
+      else:
+          return torch.ops.fbgemm.invert_permute_cuda(x)
+
+  B. 在DISPATCH宏中集成 - 扩展现有DISPATCH宏，在C++层选择：
+  DISPATCH_INVERT_PERMUTE(x, [&] {
+      if (x.is_npu()) {
+          return invert_permute_npu_impl<scalar_t>(x);
+      } else {
+          return invert_permute_cuda_impl<scalar_t>(x);
+      }
+  });
+
+  C. 统一接口分发器 - 创建分发层统一管理：
+  Tensor invert_permute(const Tensor& x) {
+      if (x.is_npu()) {
+          return invert_permute_npu(x);
+      }
+      return invert_permute_cuda(x);
+  }
+
+  这会影响代码的可维护性和性能。你倾向于哪种？
+
+❯ 哪种方案的可维护性和性能最好？ 
+
+● 从可维护性和性能两个角度分析：
+
+  性能对比
+  ┌──────────────────┬────────────────────────────────┐
+  │       方案       │            性能开销            │
+  ├──────────────────┼────────────────────────────────┤
+  │ A - Python层分发 │ +~1-5μs（Python→C++调用）      │
+  ├──────────────────┼────────────────────────────────┤
+  │ B - DISPATCH宏内 │ +~10ns（if判断，可忽略）       │
+  ├──────────────────┼────────────────────────────────┤
+  │ C - C++分发器    │ +~10ns（函数指针调用，可忽略） │
+  └──────────────────┴────────────────────────────────┘
+  性能差异：B ≈ C >> A，但相比算子执行时间（通常毫秒级），这个差异可忽略。
+
+  可维护性对比
+  ┌──────────────────┬─────────────────────┬─────────────────────────────────┐
+  │       方案       │      可维护性       │       FBGEMM owner接受度        │
+  ├──────────────────┼─────────────────────┼─────────────────────────────────┤
+  │ A - 独立入口     │ ⭐⭐⭐⭐⭐ 完全解耦 │ ⭐⭐⭐⭐⭐ 不改现有代码         │
+  ├──────────────────┼─────────────────────┼─────────────────────────────────┤
+  │ B - 集成DISPATCH │ ⭐⭐ 污染CUDA代码   │ ⭐ 需改大量现有文件             │
+  ├──────────────────┼─────────────────────┼─────────────────────────────────┤
+  │ C - 统一分发器   │ ⭐⭐⭐⭐ 清晰的分层 │ ⭐⭐⭐⭐ 新增代码，不修改旧代码 │
+  └──────────────────┴─────────────────────┴─────────────────────────────────┘
+  最佳推荐：方案C - 统一接口分发器
+
+  理由：
+  1. 性能优秀：C++层分发，开销可忽略
+  2. 可维护性高：分发逻辑集中，易于理解和修改
+  3. 解耦彻底：不修改现有CUDA/CPU代码
+  4. 易于合入：FBGEMM owner只需review新增的分发器代码
+  5. 灵活性好：便于未来添加更多硬件后端
+
+  示例代码结构：
+  // fbgemm_gpu/src/npu/dispatch/dispatcher.h
+  Tensor invert_permute(const Tensor& x) {
+      if (x.is_npu()) {
+          return invert_permute_npu(x);
+      }
+      return invert_permute_cuda(x);  // 现有实现
+  }
+
+  你认同方案C吗？
+
+❯ 提供三种方案的示例代码，我再选择 
+
+● 好的，让我先查看FBGEMM现有的算子实现，然后给出三种方案的具体示例代码。
+
+● Search(pattern: "FBGEMM_DISPATCH|DISPATCH_", head_limit: 10)
+  ⎿  Found 10 files (ctrl+o to expand)
+
+● Bash(ls -la /home/hsl/FBGEMM/fbgemm_gpu/src/sparse_ops/)
+  ⎿  total 488
+     drwxr-xr-x.  2 root root   4096 Jan 23 20:10 .
+     drwxr-xr-x. 23 root root   4096 Jan 23 22:31 ..
+     … +41 lines (ctrl+o to expand)
+
+● Read(fbgemm_gpu/src/sparse_ops/sparse_ops_gpu.cpp)
+  ⎿  Read 672 lines
+
+● Search(pattern: "FBGEMM_OP_DISPATCH", output_mode: "content")
+  ⎿  Found 432 lines (ctrl+o to expand)
+
+● Bash(ls -la /home/hsl/FBGEMM/include/fbgemm_gpu/)
+  ⎿  Error: Exit code 2
+     ls: cannot access '/home/hsl/FBGEMM/include/fbgemm_gpu/': No such file or 
+     directory
+
+● Search(pattern: "define FBGEMM_OP_DISPATCH", path: "/home/hsl/FBGEMM",
+        output_mode: "content", head_limit: 10)
+  ⎿  Found 6 lines (ctrl+o to expand)
+
+● 现在我理解了完整的架构，让我给出三种方案的详细示例代码。我会以invert_permute算
+  子为例：
+
+● Write(docs/NPU适配方案对比.md)
+  ⎿  Wrote 433 lines to docs/NPU适配方案对比.md
+      1 # NPU适配方案对比 - 以invert_permute算子为例
+      2 ## 前置条件：现有CUDA实现
+      3 **文件位置**: `fbgemm_gpu/src/sparse_ops/sparse_invert_permute.cu
+        `
+      4 ```cpp
+      5 namespace fbgemm_gpu {
+      6 template <typename index_t>
+     … +423 lines (ctrl+o to expand)
+
+● 我已经为你准备了三种方案的详细示例代码，保存在 docs/NPU适配方案对比.md。
+
+  快速总结
+
+  方案A: 独立的NPU算子入口 (Python层分发)
+
+  - 性能: +1-5μs
+  - 特点: 完全解耦，独立开发
+  - 缺点: Python层有调用开销
+
+  方案B: 在DISPATCH宏中集成 (C++层集成)
+
+  - 性能: +10ns（几乎无开销）
+  - 特点: 性能最优
+  - 缺点: 高度侵入现有代码，需要修改所有CUDA实现文件，不符合独立团队协作模式
+
+  方案C: 统一接口分发器 (推荐)
+
+  - 性能: +10ns（几乎无开销）
+  - 特点: 性能优秀 + 完全解耦 + 清晰分层
+  - 优势: 易于扩展、便于合入、支持独立团队协作
+
+  三种方案都有完整的代码示例，包括：
+  - 目录结构
+  - NPU算子实现
+  - PyTorch绑定
+  - 用户调用方式
+  - 优缺点分析
+
+  请查看文档后选择你倾向的方案。
+
+❯ <ide_opened_file>The user opened the file                                 
+  /home/hsl/FBGEMM/docs/NPU适配方案对比.md in the IDE. This may or may not  
+  be related to the current task.</ide_opened_file>                         
+
+❯ 选择方案C统一接口分发器 
+
+● 很好，选择方案C - 统一接口分发器。
+
+● 第九个问题： 关于AscendC Kernel的编译和链接方式，参考样例使用了msopgen工具生成
+  框架代码并独立编译。你希望：
+
+  A. 两阶段编译（推荐） - AscendC kernel独立编译成.so，运行时动态加载：
+  # 阶段1: 编译AscendC算子
+  add_library(ascendc_invert_permute SHARED
+      ascendc_kernels/invert_permute.ascendc
+  )
+
+  # 阶段2: NPU wrapper链接AscendC算子库
+  target_link_libraries(fbgemm_npu PRIVATE
+      ascendc_invert_permute
+      aclnn_lib  # Ascend ACLNN API
+  )
+  - 优点：AscendC工具链独立，可以单独调试和优化
+  - 符合AscendC样例的编译模式
+
+  B. 统一编译 - 将AscendC代码直接编译进FBGEMM主库：
+  # 一次性编译所有代码
+  add_library(fbgemm_gpu SHARED
+      ${CUDA_SOURCES}
+      ${NPU_SOURCES}
+      ${ASCENDC_SOURCES}
+  )
+  - 优点：单一库文件，部署简单
+  - 缺点：需要配置AscendC编译器到主CMake
+
+  C. 混合方式 - 提供两种编译模式：
+  - 开发时：两阶段编译，快速迭代
+  - 发布时：可选择统一编译
+
+  你倾向于哪种编译方式？
+
+❯ 和之前的问题一样，你觉得哪种方式更适合FBGEMM项目的硬件解耦和软件演进，需  
+  要考虑项目owner更愿意哪种方式让我合入。                                   
+
+● 从FBGEMM项目owner的角度分析，我强烈推荐 方案A - 两阶段编译。
+
+  为什么方案A最容易被接受
+
+  1. 零侵入主CMake
+
+  - AscendC编译器工具链完全隔离
+  - 不修改fbgemm_gpu/CMakeLists.txt的核心逻辑
+  - 只需在NPU目录下添加独立的编译配置
+  - FBGEMM owner审查时只需关注NPU wrapper部分
+
+  2. 符合AscendC生态标准
+
+  - AscendC样例本身就是独立编译模式
+  - 昇腾团队可以复用现有工具链和脚本
+  - 无需重新设计AscendC的编译流程
+
+  3. 独立迭代能力
+
+  昇腾团队独立开发流程：
+  1. 修改AscendC kernel → 独立编译 → 测试 → 优化
+  2. 不影响FBGEMM主代码
+  3. 准备好后再提交PR
+
+  4. 依赖管理清晰
+
+  # FBGEMM主库无NPU依赖
+  add_library(fbgemm_gpu SHARED ${CUDA_SOURCES})
+
+  # NPU支持是可选的
+  if(USE_NPU AND ASCENDC_FOUND)
+      add_subdirectory(src/npu)
+      target_link_libraries(fbgemm_gpu PRIVATE fbgemm_npu_wrapper)
+  endif()
+
+  5. 部署灵活性
+
+  - 可以提供预编译的AscendC算子包
+  - 用户按需安装NPU支持
+  - 不强制所有用户安装AscendC工具链
+
+  对比其他方案
+  ┌──────────────┬───────┬───────┬───────┐
+  │     维度     │ 方案A │ 方案B │ 方案C │
+  ├──────────────┼───────┼───────┼───────┤
+  │ 主CMake修改  │ 最小  │ 大    │ 中    │
+  ├──────────────┼───────┼───────┼───────┤
+  │ 工具链侵入性 │ 无    │ 高    │ 中    │
+  ├──────────────┼───────┼───────┼───────┤
+  │ 审查负担     │ 低    │ 高    │ 中    │
+  ├──────────────┼───────┼───────┼───────┤
+  │ 合入难度     │ 低    │ 高    │ 中    │
+  └──────────────┴───────┴───────┴───────┘
+  实际案例参考
+
+  FBGEMM现有的ROCm支持也是类似思路：
+  - ROCm通过HIPify工具链独立处理
+  - 不直接在主CMake中集成ROCm编译器
+  - 保持主构建系统的简洁性
+
+  结论：方案A是最佳选择。
+
+  你认同方案A吗？
+
+❯ 好，选用方案A 
+
+● 好的，选用方案A - 两阶段编译。
+
+● 第十个问题：
+  关于类型调度系统，FBGEMM使用AT_DISPATCH_INDEX_TYPES、FBGEMM_DISPATCH_FLOAT_AND
+  _HALF等宏进行编译时类型多态。AscendC算子通常也有类似的类型支持机制。你希望：
+
+  A. 映射到FBGEMM类型系统（推荐） - 在NPU wrapper中复用FBGEMM的DISPATCH宏：
+  Tensor invert_permute_npu(const Tensor& permute) {
+      // 复用FBGEMM的类型调度系统
+      AT_DISPATCH_INDEX_TYPES(permute.scalar_type(), "invert_permute_npu", [&] {
+          invert_permute_npu_impl<index_t>(permute);
+      });
+  }
+
+  template <typename index_t>
+  void invert_permute_npu_impl(const Tensor& permute) {
+      // 调用对应的AscendC算子实例
+      if constexpr (std::is_same_v<index_t, int32_t>) {
+          EXEC_NPU_CMD(aclnnInvertPermuteInt32, ...);
+      } else if constexpr (std::is_same_v<index_t, int64_t>) {
+          EXEC_NPU_CMD(aclnnInvertPermuteInt64, ...);
+      }
+  }
+  - 优点：保持FBGEMM的编程模型一致
+  - NPU开发者可以理解FBGEMM的类型系统
+
+  B. 独立的NPU类型系统 - AscendC算子自己管理类型：
+  Tensor invert_permute_npu(const Tensor& permute) {
+      // NPU自己处理类型转换和调度
+      auto dtype = get_ascendc_dtype(permute.scalar_type());
+      ascendc_invert_permute(dtype, ...);
+  }
+  - 优点：AscendC算子完全独立
+  - 缺点：类型系统不一致，可能有性能损失
+
+  C. 混合方式 - 提供两层抽象：
+  - 外层：FBGEMM DISPATCH宏
+  - 内层：AscendC类型映射
+
+  你倾向于哪种类型处理方式？
+
+❯ 方案A. 映射到FBGEMM类型系统 
+
+● 好的，映射到FBGEMM类型系统。现在我已经收集了所有关键的设计决策，可以开始呈现完
+  整的技术架构设计了。
+
+  现在开始呈现设计文档，我会分章节进行，每节200-300字左右。
+
+  第一章：总体架构设计
+
+  1.1 设计目标
+
+  FBGEMM_GPU昇腾NPU适配框架的核心目标是：在不破坏现有代码结构和编译流程的前提下
+  ，提供完整的NPU后端支持。关键设计原则包括：
+
+  1. 完全解耦：NPU代码独立于CUDA/CPU实现，昇腾团队可以自主开发维护
+  2. 零侵入：不修改现有CUDA/CPU源文件，通过分发器实现路由
+  3. 性能优先：C++层分发保证最小开销（~10ns）
+  4. 渐进式集成：NPU作为可选后端，默认关闭，不影响其他开发者
+
+  1.2 分层架构
+
+  采用四层架构设计，从上到下依次为：
+
+  ┌─────────────────────────────────────────┐
+  │  PyTorch用户层                           │
+  │  torch.ops.fbgemm.xxx(tensor)           │
+  └──────────────┬──────────────────────────┘
+                 │ 自动设备检测
+  ┌──────────────▼──────────────────────────┐
+  │  统一分发层 (Dispatcher)                 │
+  │  根据tensor.device()路由到对应后端       │
+  └──────────────┬──────────────────────────┘
+                 │
+       ┌─────────┼─────────┬─────────┐
+       │         │         │         │
+  ┌────▼───┐ ┌──▼────┐ ┌──▼────┐ ┌──▼────┐
+  │ CUDA   │ │  CPU  │ │  NPU   │ │ ROCm  │
+  │ 实现   │ │ 实现  │ │ 实现   │ │ 实现  │
+  └────────┘ └───────┘ └───────┘ └───────┘
+
+  1.3 目录组织
+
+  fbgemm_gpu/
+  ├── src/
+  │   ├── sparse_ops/           # 现有CUDA实现（不变）
+  │   ├── npu/                  # NPU后端（新增）
+  │   │   ├── dispatch/         # 分发器层
+  │   │   ├── sparse_ops/       # NPU算子实现
+  │   │   ├── quantize_ops/     # NPU量化算子
+  │   │   ├── utils/            # NPU工具函数
+  │   │   ├── ascendc/          # AscendC kernel（独立编译）
+  │   │   └── CMakeLists.txt    # NPU构建配置
+  │   └── ...
+  ├── include/fbgemm_gpu/       # 公共头文件
+  │   └── npu/                  # NPU公共接口（新增）
+  └── CMakeLists.txt            # 主构建配置（最小修改）
+
+  这一节看起来如何？是否符合你的预期？
+
+❯ 没问题 
+
+● 很好，继续下一部分。
+
+  第二章：核心组件设计
+
+  2.1 统一分发器 (Dispatcher)
+
+  分发器是整个架构的核心，负责根据张量设备类型路由到对应后端实现。设计要点：
+
+  文件位置: fbgemm_gpu/src/npu/dispatch/dispatcher.h
+
+  分发器提供统一的算子入口，使用前向声明避免循环依赖。通过inline函数保证零额外开
+  销，编译器会优化掉函数调用。分发逻辑使用简单的if-else链，根据tensor.device().t
+  ype()判断：
+
+  c10::DeviceType device_type = tensor.device().type();
+  if (device_type == c10::kPrivateUse1) {  // NPU
+      return npu::op_npu(tensor);
+  } else if (device_type == c10::kCUDA) {
+      return cuda::op_cuda(tensor);
+  } else {
+      return cpu::op_cpu(tensor);
+  }
+
+  为避免代码重复，设计宏系统自动生成分发器。支持两种扩展模式：
+  - 单算子添加: 手动注册新算子的分发函数
+  - 批量注册: 使用FOR_EACH_NPU_OP宏批量生成
+
+  2.2 NPU算子实现层
+
+  每个NPU算子包含两个组件：
+
+  Wrapper层 (fbgemm_gpu/src/npu/sparse_ops/*.cpp):
+  - 提供符合FBGEMM规范的C++接口
+  - 使用AT_DISPATCH_*宏进行类型调度
+  - 处理张量连续性、设备检查等前置条件
+  - 调用AscendC算子或ACLNN API
+
+  AscendC Kernel层 (fbgemm_gpu/src/npu/ascendc/*.ascendc):
+  - 实现实际的NPU计算逻辑
+  - 独立编译为.so文件
+  - 运行时动态加载
+
+  两层通过符号绑定或ACLNN API连接，保证AscendC代码可以独立开发和优化。
+
+  这一节的组件设计是否清晰？
+
+❯ 1. ascendc的kernel实现文件不是ascendc后缀 2. 算子实现没有考虑host         
+  tiling的内容                                                              
+
+● 好的，让我修正这两个问题。先让我查看AscendC样例的实际文件结构和tiling实现。
+
+● Bash(ls -la /home/hsl/RecSDK/cust_op/ascendc_op/ai_core_op/invert_permute/
+      2>/dev/null || ls -la
+      /home/hsl/RecSDK/cust_op/ascendc_op/ai_core_op/token_mixing/ 2>/dev/…)
+  ⎿  total 12
+     drwxr-xr-x.  3 root root 4096 Jan 23 22:21 .
+     drwxr-xr-x. 35 root root 4096 Jan 23 22:21 ..
+     drwxr-xr-x.  4 root root 4096 Jan 23 22:21 c310
+
+● Read(/home/hsl/RecSDK/cust_op/ascendc_op/ai_core_op/invert_permute/c310/op_hos
+      t/invert_permute_tiling.h)
+  ⎿  Read 28 lines
+
+● Read(/home/hsl/RecSDK/cust_op/ascendc_op/ai_core_op/invert_permute/c310/op_ker
+      nel/invert_permute.cpp)
+  ⎿  Read 38 lines
+
+● 非常感谢指正！现在我理解了AscendC的实际结构。让我修正第二章：
+
+  第二章：核心组件设计（修正版）
+
+  2.1 统一分发器
+
+  分发器是整个架构的核心，负责根据张量设备类型路由到对应后端实现。设计要点：
+
+  文件位置: fbgemm_gpu/src/npu/dispatch/dispatcher.h
+
+  分发器提供统一的算子入口，使用前向声明避免循环依赖。通过inline函数保证零额外开
+  销，编译器会优化掉函数调用。分发逻辑使用简单的if-else链，根据tensor.device().t
+  ype()判断后端类型。
+
+  为避免代码重复，设计宏系统自动生成分发器。支持两种扩展模式：
+  - 单算子添加: 手动注册新算子的分发函数
+  - 批量注册: 使用FOR_EACH_NPU_OP宏批量生成
+
+  2.2 NPU算子实现层
+
+  每个NPU算子采用三层架构，完全对应AscendC的设计模式：
+
+  Layer 1: PyTorch Wrapper层 (fbgemm_gpu/src/npu/sparse_ops/*.cpp):
+  - 提供符合FBGEMM规范的C++接口
+  - 使用AT_DISPATCH_*宏进行类型调度
+  - 处理张量连续性、设备检查等前置条件
+  - 调用ACLNN API或AscendC编译生成的算子接口
+
+  Layer 2: AscendC Host层 (fbgemm_gpu/src/npu/ascendc/op_host/):
+  - .cpp: 包含Tiling函数、Shape推导、类型推导
+  - _tiling.h: Tiling数据结构定义
+  - 负责计算如何将数据分块到多个AI Core（类似CUDA的grid/block配置）
+  - 根据输入shape和数据类型设置tiling参数
+
+  Layer 3: AscendC Kernel层 (fbgemm_gpu/src/npu/ascendc/op_kernel/):
+  - .cpp: 实际的NPU计算逻辑（使用AscendC API）
+  - _kernel.h: Kernel函数声明
+  - 从tiling参数读取配置并执行SIMT并行计算
+
+  2.3 AscendC目录结构
+
+  fbgemm_gpu/src/npu/ascendc/
+  ├── op_host/
+  │   ├── invert_permute.cpp          # Host侧实现
+  │   └── invert_permute_tiling.h     # Tiling数据结构
+  ├── op_kernel/
+  │   ├── invert_permute.cpp          # Kernel侧实现
+  │   └── invert_permute_kernel.h     # Kernel声明
+  └── CMakeLists.txt                  # AscendC独立编译配置
+
+  Tiling机制的作用：
+  - 计算需要的AI Core数量（blockDim）
+  - 计算每个block的线程数（threadsPerBlock）
+  - 根据数据类型选择kernel实例（通过TilingKey）
+  - 将参数传递给Kernel执行
+
+  这一节修正后是否准确？
+
+❯ 每个算子使用单独的op_host和op_kernel目录，结构上是不是更解耦？从架构解耦  
+  、代码演进、FBGEMM仓库owner接受度上分析一下                               
+
+❯ 分析结果是什么？ 
+
+● 让我从三个维度详细分析这两种目录组织方式：
+
+  分析对比
+
+  方式1：每个算子独立目录（推荐）
+
+  ascendc/
+  ├── invert_permute/
+  │   ├── op_host/
+  │   └── op_kernel/
+  ├── permute_1d/
+  │   ├── op_host/
+  │   └── op_kernel/
+
+  方式2：共享op_host和op_kernel目录
+
+  ascendc/
+  ├── op_host/
+  │   ├── invert_permute.cpp
+  │   ├── permute_1d.cpp
+  │   └── ...
+  ├── op_kernel/
+  │   ├── invert_permute.cpp
+  │   ├── permute_1d.cpp
+  │   └── ...
+
+  ---
+  维度1：架构解耦
+  ┌────────────┬─────────────────────────┬─────────────────────────┐
+  │   评估项   │    方式1 (独立目录)     │    方式2 (共享目录)     │
+  ├────────────┼─────────────────────────┼─────────────────────────┤
+  │ 算子隔离度 │ ⭐⭐⭐⭐⭐ 完全隔离     │ ⭐⭐ 文件混在一起       │
+  ├────────────┼─────────────────────────┼─────────────────────────┤
+  │ 依赖关系   │ ⭐⭐⭐⭐⭐ 无隐藏依赖   │ ⭐⭐⭐ 容易产生隐式依赖 │
+  ├────────────┼─────────────────────────┼─────────────────────────┤
+  │ 并行开发   │ ⭐⭐⭐⭐⭐ 多人互不干扰 │ ⭐⭐ 文件冲突风险       │
+  ├────────────┼─────────────────────────┼─────────────────────────┤
+  │ 代码边界   │ ⭐⭐⭐⭐⭐ 清晰明确     │ ⭐⭐⭐ 边界模糊         │
+  └────────────┴─────────────────────────┴─────────────────────────┘
+  结论: 方式1在解耦方面明显优势
+
+  ---
+  维度2：代码演进
+  ┌────────────┬─────────────────────────────┬─────────────────────────┐
+  │   评估项   │      方式1 (独立目录)       │    方式2 (共享目录)     │
+  ├────────────┼─────────────────────────────┼─────────────────────────┤
+  │ 添加新算子 │ ⭐⭐⭐⭐⭐ 复制模板即可     │ ⭐⭐⭐ 需要理解现有结构 │
+  ├────────────┼─────────────────────────────┼─────────────────────────┤
+  │ 删除算子   │ ⭐⭐⭐⭐⭐ 删除整个目录     │ ⭐⭐ 需要删除多个文件   │
+  ├────────────┼─────────────────────────────┼─────────────────────────┤
+  │ 算子重构   │ ⭐⭐⭐⭐⭐ 不影响其他算子   │ ⭐⭐⭐ 可能影响其他算子 │
+  ├────────────┼─────────────────────────────┼─────────────────────────┤
+  │ 版本管理   │ ⭐⭐⭐⭐⭐ 每个算子独立版本 │ ⭐⭐⭐ 共享版本         │
+  ├────────────┼─────────────────────────────┼─────────────────────────┤
+  │ 代码审查   │ ⭐⭐⭐⭐⭐ 变更范围清晰     │ ⭐⭐⭐ 需要检查所有变更 │
+  └────────────┴─────────────────────────────┴─────────────────────────┘
+  具体场景：
+  - 方式1：添加new_op算子
+  cp -r invert_permute new_op
+  # 只需修改new_op/下的文件，零风险
+  - 方式2：添加new_op算子
+  # 需要在op_host/和op_kernel/下各创建新文件
+  # 可能意外修改公共头文件，影响其他算子
+
+  结论: 方式1更有利于长期演进
+
+  ---
+  维度3：FBGEMM Owner接受度
+
+  从Owner视角的考量：
+
+  方式1的优势：
+  1. ✅ 符合FBGEMM现有模式
+    - FBGEMM已经有按功能模块组织的目录（sparse_ops/, quantize_ops/等）
+    - 每个模块内部文件独立
+    - Owner熟悉这种模式
+  2. ✅ Review负担小
+    - PR只涉及特定算子目录
+    - 变更范围一目了然
+    - 不需要理解整个AscendC结构
+  3. ✅ 合并冲突少
+    - 不同算子的PR不会冲突
+    - 可以独立合并
+    - 降低合并风险
+  4. ✅ 易于回滚
+    - 单个算子有问题，直接回滚该目录
+    - 不影响其他算子
+
+  方式2的劣势：
+  1. ❌ 不符合FBGEMM模式
+    - Owner不习惯这种扁平化结构
+    - 需要学习新的组织方式
+  2. ❌ Review负担重
+    - PR可能修改op_host/或op_kernel/下多个文件
+    - 需要全面检查是否影响其他算子
+    - 不确定变更范围
+  3. ❌ 合并冲突频繁
+    - 多个算子的PR容易冲突
+    - 需要频繁解决冲突
+
+  ---
+  参考AscendC样例
+
+  查看样例实际结构：
+  /home/hsl/RecSDK/cust_op/ascendc_op/ai_core_op/
+  ├── invert_permute/
+  │   └── c310/          # 版本目录
+  │       ├── op_host/
+  │       └── op_kernel/
+  ├── token_mixing/
+  │   └── v220/          # 版本目录
+  │       ├── op_host/
+  │       └── op_kernel/
+
+  AscendC本身采用的就是每个算子独立目录的方式！
+
+  ---
+  最终结论
+
+  强烈推荐：方式1 - 每个算子使用独立的op_host和op_kernel目录
+
+  理由：
+
+  1. 架构解耦：⭐⭐⭐⭐⭐
+    - 完全隔离，符合独立团队协作需求
+  2. 代码演进：⭐⭐⭐⭐⭐
+    - 渐进式添加，风险最小
+    - 每个算子独立迭代
+  3. FBGEMM接受度：⭐⭐⭐⭐⭐
+    - 符合现有项目模式
+    - Review和合并成本最低
+    - 冲突风险最小
+  4. 额外优势：
+    - 符合AscendC样例的实践
+    - 每个算子可以独立配置CMake
+    - 便于性能分析和优化
+
+  建议的目录结构：
+
+  fbgemm_gpu/src/npu/ascendc/
+  ├── invert_permute/
+  │   ├── op_host/
+  │   │   ├── invert_permute.cpp
+  │   │   └── invert_permute_tiling.h
+  │   └── op_kernel/
+  │       ├── invert_permute.cpp
+  │       └── invert_permute_kernel.h
+  ├── permute_1d/
+  │   ├── op_host/
+  │   └── op_kernel/
+  └── CMakeLists.txt
+
+  你认同这个结论吗？
+
+❯ 可以，就这个方案 
+
+● 很好，继续完善架构设计。
+
+  第二章：核心组件设计（最终版）
+
+  2.1 统一分发器 (Dispatcher)
+
+  文件位置: fbgemm_gpu/src/npu/dispatch/dispatcher.h
+
+  分发器提供统一的算子入口，使用前向声明避免循环依赖。通过inline函数保证零额外开
+  销（~10ns）。分发逻辑根据tensor.device().type()判断：
+
+  inline Tensor invert_permute(const Tensor& permute) {
+    if (permute.device().type() == c10::kPrivateUse1) {
+      return npu::invert_permute_npu(permute);
+    } else if (permute.device().type() == c10::kCUDA) {
+      return cuda::invert_permute_cuda(permute);
+    }
+    return cpu::invert_permute_cpu(permute);
+  }
+
+  2.2 NPU算子三层架构
+
+  Layer 1: PyTorch Wrapper层 (fbgemm_gpu/src/npu/sparse_ops/*.cpp)
+  - 提供符合FBGEMM规范的C++接口
+  - 使用AT_DISPATCH_*宏进行类型调度
+  - 处理张量连续性、设备检查等前置条件
+
+  Layer 2: AscendC Host层 (每个算子独立的op_host/)
+  - .cpp: Tiling函数、Shape推导、类型推导
+  - _tiling.h: Tiling数据结构定义
+  - 计算AI Core数量、线程数、数据分块策略
+
+  Layer 3: AscendC Kernel层 (每个算子独立的op_kernel/)
+  - .cpp: NPU计算逻辑（AscendC API）
+  - _kernel.h: Kernel函数声明
+  - 从tiling参数读取配置并执行
+
+  2.3 AscendC目录结构（每个算子独立）
+
+  fbgemm_gpu/src/npu/ascendc/
+  ├── invert_permute/
+  │   ├── op_host/
+  │   │   ├── invert_permute.cpp
+  │   │   └── invert_permute_tiling.h
+  │   └── op_kernel/
+  │       ├── invert_permute.cpp
+  │       └── invert_permute_kernel.h
+  ├── permute_1d/
+  │   ├── op_host/
+  │   │   ├── permute_1d.cpp
+  │   │   └── permute_1d_tiling.h
+  │   └── op_kernel/
+  │       ├── permute_1d.cpp
+  │       └── permute_1d_kernel.h
+  ├── ...
+  └── CMakeLists.txt
+
+  优势：完全解耦、独立演进、符合AscendC实践、易于合入。
+
+  这一节现在完整了吗？
+
+❯ 可以的 
+
+● 很好，继续下一章。
+
+  第三章：编译系统设计
+
+  3.1 两阶段编译架构
+
+  采用完全独立的编译流程，AscendC算子与FBGEMM主库分开编译：
+
+  ┌─────────────────────────────────────────────────┐
+  │  阶段1: AscendC算子编译                          │
+  │  工具: AscendC Compiler (msopgen + soc)        │
+  │  输入: op_host/*.cpp + op_kernel/*.cpp          │
+  │  输出: libinvert_permute.so, libpermute_1d.so   │
+  │  触发: cmake -DUSE_NPU=ON                       │
+  └─────────────────────────────────────────────────┘
+                         ↓
+  ┌─────────────────────────────────────────────────┐
+  │  阶段2: NPU Wrapper编译                         │
+  │  工具: CMake + CANN                             │
+  │  输入: npu/sparse_ops/*.cpp + 阶段1的.so        │
+  │  输出: libfbgemm_npu.so                         │
+  │  链接: libfbgemm_gpu.so                         │
+  └─────────────────────────────────────────────────┘
+
+  3.2 CMake配置结构
+
+  主CMakeLists.txt修改 (最小侵入):
+  # fbgemm_gpu/CMakeLists.txt
+
+  # NPU支持 - 可选依赖
+  option(USE_NPU "Build with Ascend NPU support" OFF)
+
+  if(USE_NPU)
+    # 检查CANN工具链
+    find_package(CANN REQUIRED)
+
+    # 添加NPU子目录
+    add_subdirectory(src/npu)
+
+    # 链接NPU wrapper
+    target_link_libraries(fbgemm_gpu PRIVATE fbgemm_npu_wrapper)
+  endif()
+
+  NPU CMakeLists.txt:
+  # fbgemm_gpu/src/npu/CMakeLists.txt
+
+  # 编译AscendC算子
+  add_subdirectory(ascendc)
+
+  # NPU Wrapper库
+  add_library(fbgemm_npu_wrapper STATIC
+    dispatch/sparse_ops.cpp
+    sparse_ops/invert_permute.cpp
+    sparse_ops/permute_1d.cpp
+  )
+
+  target_link_libraries(fbgemm_npu_wrapper
+    PUBLIC
+      fbgemm_gpu::utils
+      torch::torch
+      ${CANN_LIBRARIES}
+      ascendc_ops  # AscendC算子集合
+  )
+
+  target_include_directories(fbgemm_npu_wrapper
+    PUBLIC
+      ${CANN_INCLUDE_DIRS}
+      ${CMAKE_CURRENT_SOURCE_DIR}
+  )
+
+  AscendC CMakeLists.txt:
+  # fbgemm_gpu/src/npu/ascendc/CMakeLists.txt
+
+  # 为每个算子创建独立库
+  foreach(op ${NPU_ASCENDC_OPS})
+    add_subdirectory(${op})
+  endforeach()
+
+  # 聚合所有AscendC算子
+  add_library(ascendc_ops INTERFACE)
+  target_link_libraries(ascendc_ops INTERFACE ${NPU_ASCENDC_LIBS})
+
+  单个算子CMakeLists.txt (invert_permute为例):
+  # fbgemm_gpu/src/npu/ascendc/invert_permute/CMakeLists.txt
+
+  # 使用AscendC工具链编译
+  set(ASCENDC_OP_NAME invert_permute)
+  set(ASCENDC_OP_DIR ${CMAKE_CURRENT_SOURCE_DIR})
+
+  # 调用AscendC编译脚本
+  execute_process(
+    COMMAND ${ASCENDC_COMPILER}
+      --op-name ${ASCENDC_OP_NAME}
+      --op-host ${ASCENDC_OP_DIR}/op_host
+      --op-kernel ${ASCENDC_OP_DIR}/op_kernel
+      --output ${CMAKE_CURRENT_BINARY_DIR}
+    RESULT_VARIABLE ASCENDC_COMPILE_RESULT
+  )
+
+  if(NOT ASCENDC_COMPILE_RESULT EQUAL 0)
+    message(FATAL_ERROR "AscendC compilation failed for ${ASCENDC_OP_NAME}")
+  endif()
+
+  # 生成的.so文件
+  add_library(ascendc_${ASCENDC_OP_NAME} SHARED
+    ${CMAKE_CURRENT_BINARY_DIR}/${ASCENDC_OP_NAME}.o
+  )
+
+  3.3 工具链检测和配置
+
+  # 检测CANN安装路径
+  if(NOT DEFINED CANN_PATH)
+    set(CANN_PATH "/usr/local/Ascend" CACHE PATH "CANN installation path")
+  endif()
+
+  # 检测AscendC编译器
+  find_program(ASCENDC_COMPILER
+    msopgen
+    PATHS ${CANN_PATH}/bin
+    NO_DEFAULT_PATH
+  )
+
+  if(NOT ASCENDC_COMPILER)
+    message(WARNING "AscendC compiler not found. NPU support will be disabled.")
+    set(USE_NPU OFF)
+  endif()
+
+  3.4 编译产物
+
+  fbgmm_gpu/build/
+  ├── lib/
+  │   ├── libfbgemm_gpu.so              # 主库（无NPU依赖）
+  │   ├── libfbgemm_npu_wrapper.so       # NPU wrapper（需USE_NPU=ON）
+  │   └── npu_ops/                       # AscendC算子库
+  │       ├── libinvert_permute.so
+  │       ├── libpermute_1d.so
+  │       └── ...
+  └── npu/
+      └── ascendc/
+          ├── invert_permute/
+          ├── permute_1d/
+          └── ...
+
+  这一节的编译系统设计是否清晰？
+
+❯ 可以 
+
+● 很好，继续下一章。
+
+  第四章：类型系统设计
+
+  4.1 FBGEMM类型系统映射
+
+  FBGEMM使用PyTorch的AT_DISPATCH_*宏进行类型调度。NPU
+  wrapper需要映射到FBGEMM的类型系统：
+
+  // fbgemm_gpu/src/npu/sparse_ops/invert_permute.cpp
+
+  Tensor invert_permute_npu(const Tensor& permute) {
+    // 使用FBGEMM的类型调度宏
+    AT_DISPATCH_INDEX_TYPES(
+        permute.scalar_type(),
+        "invert_permute_npu",
+        [&] {
+          return invert_permute_npu_impl<index_t>(permute);
+        });
+  }
+
+  template <typename index_t>
+  Tensor invert_permute_npu_impl(const Tensor& permute) {
+    // 映射到AscendC的数据类型
+    if constexpr (std::is_same_v<index_t, int32_t>) {
+      return call_ascendc_op<int32_t>(permute);
+    } else if constexpr (std::is_same_v<index_t, int64_t>) {
+      return call_ascendc_op<int64_t>(permute);
+    }
+  }
+
+  4.2 类型映射表
+  FBGEMM/C++类型: int32_t
+  PyTorch ScalarType: kInt
+  AscendC类型: ge::DT_INT32
+  ACLNN API: aclnnInvertPermuteInt32
+  ────────────────────────────────────────
+  FBGEMM/C++类型: int64_t
+  PyTorch ScalarType: kLong
+  AscendC类型: ge::DT_INT64
+  ACLNN API: aclnnInvertPermuteInt64
+  ────────────────────────────────────────
+  FBGEMM/C++类型: float
+  PyTorch ScalarType: kFloat
+  AscendC类型: ge::DT_FLOAT
+  ACLNN API: aclnnXxxFloat
+  ────────────────────────────────────────
+  FBGEMM/C++类型: float16
+  PyTorch ScalarType: kHalf
+  AscendC类型: ge::DT_FLOAT16
+  ACLNN API: aclnnXxxFloat16
+  ────────────────────────────────────────
+  FBGEMM/C++类型: bfloat16
+  PyTorch ScalarType: kBFloat16
+  AscendC类型: ge::DT_BF16
+  ACLNN API: aclnnXxxBf16
+  4.3 NPU类型工具函数
+
+  // fbgemm_gpu/src/npu/utils/npu_type_utils.h
+
+  namespace fbgemm_gpu::npu {
+
+  // 类型映射：c10::ScalarType -> AscendC ge::DataType
+  inline ge::DataType get_ge_dtype(c10::ScalarType type) {
+    switch(type) {
+      case c10::kInt: return ge::DT_INT32;
+      case c10::kLong: return ge::DT_INT64;
+      case c10::kFloat: return ge::DT_FLOAT;
+      case c10::kHalf: return ge::DT_FLOAT16;
+      case c10::kBFloat16: return ge::DT_BF16;
+      default: TORCH_CHECK(false, "Unsupported dtype for NPU");
+    }
+  }
+
+  // 设备检查
+  inline bool is_npu_tensor(const Tensor& tensor) {
+    return tensor.device().type() == c10::kPrivateUse1;
+  }
+
+  // NPU设备保护（类似CUDA_DEVICE_GUARD）
+  class NPUDeviceGuard {
+    c10::Device prev_device;
+  public:
+    explicit NPUDeviceGuard(const Tensor& tensor) {
+      prev_device = c10::current_device();
+      c10::set_device(tensor.device());
+    }
+    ~NPUDeviceGuard() {
+      c10::set_device(prev_device);
+    }
+  };
+
+  } // namespace fbgemm_gpu::npu
+
+  4.4 类型调度宏扩展
+
+  复用FBGEMM现有的DISPATCH宏系统，最小化学习成本：
+
+  // 扩展现有的DISPATCH宏以支持NPU类型检查
+  #ifdef USE_NPU
+  #define TENSOR_ON_NPU_GPU(tensor)                                    \
+    TORCH_CHECK(                                                      \
+        fbgemm_gpu::npu::is_npu_tensor(tensor),                       \
+        "Tensor must be on NPU device but is on device: ",           \
+        tensor.device());
+  #else
+  #define TENSOR_ON_NPU_GPU(tensor)                                    \
+    TORCH_CHECK(false, "NPU support not compiled in");
+  #endif
+
+  这一节的类型系统设计是否清晰？
+
+❯ 可以 
+
+● 很好，继续下一章。
+
+  第五章：算子注册和分发机制
+
+  5.1 分发器注册流程
+
+  ┌─────────────────────────────────────────────────┐
+  │  1. 前向声明各后端实现                          │
+  │     namespace cuda { Tensor op_cuda(...); }     │
+  │     namespace npu { Tensor op_npu(...); }       │
+  │     namespace cpu { Tensor op_cpu(...); }       │
+  └─────────────────────────────────────────────────┘
+                         ↓
+  ┌─────────────────────────────────────────────────┐
+  │  2. 定义分发函数                                │
+  │     inline Tensor op(const Tensor& x) {         │
+  │       if (x.is_npu()) return npu::op_npu(x);    │
+  │       else if (x.is_cuda()) return cuda::op(x); │
+  │       else return cpu::op_cpu(x);               │
+  │     }                                           │
+  └─────────────────────────────────────────────────┘
+                         ↓
+  ┌─────────────────────────────────────────────────┐
+  │  3. 注册到PyTorch                               │
+  │     TORCH_LIBRARY_IMPL(fbgemm, CatchAll, m) {   │
+  │       m.impl("op_name", &dispatch::op);         │
+  │     }                                           │
+  └─────────────────────────────────────────────────┘
+
+  5.2 分发器代码结构
+
+  文件: fbgemm_gpu/src/npu/dispatch/dispatcher.h
+  #pragma once
+
+  #include <ATen/Tensor.h>
+  #include <torch/library.h>
+
+  namespace fbgemm_gpu::dispatch {
+
+  // 前向声明CUDA实现
+  namespace cuda {
+  Tensor invert_permute_cuda(const Tensor& permute);
+  Tensor permute_1d_cuda(const Tensor& input, const Tensor& indices);
+  // ... 其他CUDA算子
+  } // namespace cuda
+
+  // 前向声明CPU实现
+  namespace cpu {
+  Tensor invert_permute_cpu(const Tensor& permute);
+  Tensor permute_1d_cpu(const Tensor& input, const Tensor& indices);
+  // ... 其他CPU算子
+  } // namespace cpu
+
+  // NPU实现声明和定义
+  #ifdef USE_NPU
+  namespace npu {
+  Tensor invert_permute_npu(const Tensor& permute);
+  Tensor permute_1d_npu(const Tensor& input, const Tensor& indices);
+  // ... 其他NPU算子
+  } // namespace npu
+  #endif
+
+  // 统一分发函数
+  inline Tensor invert_permute(const Tensor& permute) {
+    auto device_type = permute.device().type();
+
+    if (device_type == c10::kPrivateUse1) {
+  #ifdef USE_NPU
+      return npu::invert_permute_npu(permute);
+  #else
+      TORCH_CHECK(false, "NPU support not compiled in. Please rebuild with 
+  -DUSE_NPU=ON");
+  #endif
+    } else if (device_type == c10::kCUDA) {
+      return cuda::invert_permute_cuda(permute);
+    } else {
+      return cpu::invert_permute_cpu(permute);
+    }
+  }
+
+  inline Tensor permute_1d(const Tensor& input, const Tensor& indices) {
+    auto device_type = input.device().type();
+
+    if (device_type == c10::kPrivateUse1) {
+  #ifdef USE_NPU
+      return npu::permute_1d_npu(input, indices);
+  #else
+      TORCH_CHECK(false, "NPU support not compiled in");
+  #endif
+    } else if (device_type == c10::kCUDA) {
+      return cuda::permute_1d_cuda(input, indices);
+    } else {
+      return cpu::permute_1d_cpu(input, indices);
+    }
+  }
+
+  } // namespace fbgemm_gpu::dispatch
+
+  5.3 PyTorch注册
+
+  文件: fbgemm_gpu/src/npu/dispatch/sparse_ops.cpp
+  #include "fbgemm_gpu/src/npu/dispatch/dispatcher.h"
+  #include <torch/library.h>
+
+  // 注册所有分发函数到fbgemm命名空间
+  // 使用CatchAll作为分发键，让分发器自己决定路由逻辑
+  TORCH_LIBRARY_IMPL(fbgemm, CatchAll, m) {
+    // 稀疏算子
+    m.impl("invert_permute", &fbgemm_gpu::dispatch::invert_permute);
+    m.impl("permute_1d", &fbgemm_gpu::dispatch::permute_1d);
+    m.impl("permute_2d", &fbgemm_gpu::dispatch::permute_2d);
+
+    // 扩展其他算子时在这里添加
+    // m.impl("new_op", &fbgemm_gpu::dispatch::new_op);
+  }
+
+  5.4 批量注册宏系统
+
+  为减少重复代码，提供宏系统自动生成分发器：
+
+  文件: fbgemm_gpu/src/npu/dispatch/registry.h
+  #pragma once
+
+  #define NPU_UNARY_OP(name) \
+    inline Tensor name(const Tensor& x) { \
+      return dispatch_unary_op(#name, x); \
+    }
+
+  #define NPU_BINARY_OP(name) \
+    inline Tensor name(const Tensor& x, const Tensor& y) { \
+      return dispatch_binary_op(#name, x, y); \
+    }
+
+  // 支持的算子列表
+  #define FOR_EACH_NPU_SPARSE_OP(_) \
+    _(invert_permute) \
+    _(permute_1d) \
+    _(permute_2d) \
+    _(index_select_dim0)
+
+  #define FOR_EACH_NPU_QUANTIZE_OP(_) \
+    _(quantize) \
+    _(dequantize) \
+    _(int_nbit_split_embedding_codegen_lookup_function)
+
+  // 自动生成算子分发声明
+  FOR_EACH_NPU_SPARSE_OP(NPU_UNARY_OP)
+  FOR_EACH_NPU_QUANTIZE_OP(NPU_UNARY_OP)
+
+  5.5 与现有CUDA注册的关系
+
+  现有CUDA算子保持不变：
+  // fbgemm_gpu/src/sparse_ops/sparse_invert_permute.cu
+  FBGEMM_OP_DISPATCH(CUDA, "invert_permute", fbgemm_gpu::invert_permute_cuda);
+
+  通过CatchAll分发器覆盖，实现路由：
+  - CatchAll的优先级低于具体的设备类型（CUDA/CPU）
+  - 但分发器内部会判断设备类型并调用对应实现
+  - 保持CUDA代码完全不变
+
+  这一节的算子注册和分发机制是否清晰？
+
+❯ CUDA有对应的批量注册宏系统吗，为什么NPU需要 
+
+● 好问题！让我检查一下FBGEMM现有的CUDA注册方式。
+
+● Search(pattern: "FOR_EACH_|DISPATCH_TO_CUDA", head_limit: 10)
+  ⎿  Found 10 files (ctrl+o to expand)
+
+● Search(pattern: "TORCH_LIBRARY_IMPL\(fbgemm, CUDA", output_mode: "content",
+        head_limit: 5)
+  ⎿  Found 5 lines (ctrl+o to expand)
+
+● 非常好的观察！你发现了设计中的不一致性。让我修正：
+
+● Search(pattern: "define DISPATCH_TO_CUDA", output_mode: "content", head_limit:
+         3)
+  ⎿  Found 3 lines (ctrl+o to expand)
+
+● 你说得对！我发现了一个设计问题。让我修正第五章：
+
+  第五章：算子注册和分发机制（修正版）
+
+  5.1 CUDA现有注册方式
+
+  FBGEMM的CUDA算子使用简单的DISPATCH_TO_CUDA宏逐个注册：
+
+  // fbgemm_gpu/src/sparse_ops/sparse_ops_gpu.cpp
+  TORCH_LIBRARY_IMPL(fbgemm, CUDA, m) {
+    DISPATCH_TO_CUDA("invert_permute", fbgemm_gpu::invert_permute_cuda);
+    DISPATCH_TO_CUDA("permute_1d", fbgemm_gpu::permute_1d_cuda);
+    // ... 逐个注册
+  }
+
+  DISPATCH_TO_CUDA宏定义：
+  #define DISPATCH_TO_CUDA(name, function) \
+    m.impl(name, torch::dispatch(c10::DispatchKey::CUDA, TORCH_FN(function)))
+
+  特点：
+  - ✅ 简单直接
+  - ✅ 每个算子独立注册
+  - ✅ 没有批量宏系统
+
+  5.2 NPU分发器注册（与CUDA保持一致）
+
+  NPU应该使用与CUDA完全一致的注册风格：
+
+  // fbgemm_gpu/src/npu/dispatch/sparse_ops.cpp
+  #include "fbgemm_gpu/src/npu/dispatch/dispatcher.h"
+  #include <torch/library.h>
+
+  // 使用CatchAll分发键注册分发器
+  // 分发器内部会根据设备类型路由到对应后端
+  TORCH_LIBRARY_IMPL(fbgemm, CatchAll, m) {
+    m.impl("invert_permute", &fbgemm_gpu::dispatch::invert_permute);
+    m.impl("permute_1d", &fbgemm_gpu::dispatch::permute_1d);
+    m.impl("permute_2d", &fbgemm_gpu::dispatch::permute_2d);
+    m.impl("index_select_dim0", &fbgemm_gpu::dispatch::index_select_dim0);
+    // ... 逐个注册，与CUDA风格一致
+  }
+
+  5.3 为什么不需要批量注册宏
+
+  理由：
+  1. 保持一致性：CUDA没有批量宏，NPU也不应该引入
+  2. 简单优先：YAGNI原则，目前不需要那么复杂的抽象
+  3. 减少学习成本：昇腾团队只需理解现有的CUDA注册模式
+  4. 灵活性：逐个注册更灵活，特殊算子可以单独处理
+
+  如果将来需要批量注册，可以在不破坏现有代码的前提下渐进式添加：
+  // 可选的批量宏（未来需要时再添加）
+  #define REGISTER_NPU_SPARSE_OPS(m) \
+    m.impl("invert_permute", &dispatch::invert_permute); \
+    m.impl("permute_1d", &dispatch::permute_1d); \
+    m.impl("permute_2d", &dispatch::permute_2d);
+
+  TORCH_LIBRARY_IMPL(fbgemm, CatchAll, m) {
+    REGISTER_NPU_SPARSE_OPS(m)
+  }
+
+  但目前不建议引入，保持最简单的逐个注册方式。
+
+  5.4 注册优先级说明
+
+  PyTorch的调度优先级：
+  1. 具体设备类型 (CUDA/CPU)  ← 优先级高
+  2. CatchAll                   ← 优先级低，但可以覆盖所有情况
+
+  通过CatchAll注册分发器后：
+  - CUDA张量：分发器检测到device.type() == CUDA，调用cuda::op_cuda()
+  - NPU张量：分发器检测到device.type() == PrivateUse1，调用npu::op_npu()
+  - CPU张量：分发器检测到device.type() == CPU，调用cpu::op_cpu()
+
+  这样无需修改CUDA现有注册代码，完全解耦。
+
+  这一节修正后是否合理？
+
+❯ 可以了 
+
+● 很好，继续下一章。
+
+  第六章：错误处理和日志
+
+  6.1 错误处理策略
+
+  NPU算子的错误处理需要与FBGEMM现有风格保持一致：
+
+  FBGEMM现有风格：
+  // CUDA算子的错误处理
+  Tensor invert_permute_cuda(const Tensor& permute) {
+    TENSOR_ON_CUDA_GPU(permute);  // 设备检查
+    CUDA_DEVICE_GUARD(permute);    // 设备保护
+
+    TORCH_CHECK_VALUE(
+        permute.dim() == 1,
+        "invert_permute expects 1D tensor, got ",
+        permute.dim());
+  }
+
+  NPU采用相同风格：
+  // fbgemm_gpu/src/npu/sparse_ops/invert_permute.cpp
+
+  Tensor invert_permute_npu(const Tensor& permute) {
+  #ifdef USE_NPU
+    // 设备检查
+    TENSOR_ON_NPU_GPU(permute);
+
+    // 设备保护
+    NPUDeviceGuard guard(permute);
+
+    // 参数验证
+    TORCH_CHECK_VALUE(
+        permute.dim() == 1,
+        "invert_permute expects 1D tensor, got ",
+        permute.dim());
+
+    TORCH_CHECK_VALUE(
+        permute.numel() > 0 && permute.numel() <= (1L << 31),
+        "invert_permute: tensor size must be in [1, 2^31], got ",
+        permute.numel());
+
+    // 调用AscendC算子
+    Tensor output = at::empty_like(permute);
+    EXEC_NPU_CMD(aclnnInvertPermute, permute, output);
+
+    return output;
+  #else
+    TORCH_CHECK(false, "NPU support not compiled in");
+  #endif
+  }
+
+  6.2 NPU专用宏定义
+
+  // fbgemm_gpu/src/npu/utils/npu_ops_utils.h
+
+  #pragma once
+
+  #include <ATen/Tensor.h>
+  #include <c10/core/DeviceType.h>
+  #include <torch/library.h>
+
+  #ifdef USE_NPU
+
+  namespace fbgemm_gpu::npu {
+
+  // 设备检查宏（类似TENSOR_ON_CUDA_GPU）
+  #define TENSOR_ON_NPU_GPU(tensor)                                    \
+    TORCH_CHECK(                                                      \
+        (tensor).device().type() == c10::kPrivateUse1,                \
+        "Tensor must be on NPU device but is on device: ",           \
+        (tensor).device());
+
+  // NPU设备保护类
+  class NPUDeviceGuard {
+    c10::Device prev_device_;
+  public:
+    explicit NPUDeviceGuard(const at::Tensor& tensor) 
+      : prev_device_(c10::current_device()) {
+      c10::set_device(tensor.device());
+    }
+
+    ~NPUDeviceGuard() {
+      c10::set_device(prev_device_);
+    }
+
+    // 禁止拷贝
+    NPUDeviceGuard(const NPUDeviceGuard&) = delete;
+    NPUDeviceGuard& operator=(const NPUDeviceGuard&) = delete;
+  };
+
+  // ACLNN错误检查宏
+  #define CHECK_NPU_CMD(cmd)                                          \
+    do {                                                              \
+      auto ret = (cmd);                                               \
+      if (ret != 0) {                                                 \
+        TORCH_CHECK(false, "NPU command failed: " #cmd ", ret=", ret); \
+      }                                                               \
+    } while(0)
+
+  } // namespace fbgemm_gpu::npu
+
+  #endif // USE_NPU
+
+  6.3 日志系统
+
+  复用FBGEMM现有的日志系统（如果有），或使用PyTorch标准日志：
+
+  // 使用PyTorch的logging系统
+  #include <ATen/Logging.h>
+
+  Tensor invert_permute_npu(const Tensor& permute) {
+  #ifdef USE_NPU
+    // 调试日志
+    VLOG(1) << "invert_permute_npu called with tensor shape: "
+            << permute.sizes();
+
+    // 性能日志
+    at::record_function_start("invert_permute_npu");
+
+    // 执行算子
+    Tensor output = ...;
+
+    at::record_function_end("invert_permute_npu");
+
+    return output;
+  #else
+    TORCH_CHECK(false, "NPU support not compiled in");
+  #endif
+  }
+
+  6.4 错误信息一致性
+
+  所有错误信息需要遵循FBGEMM的命名和格式规范：
+
+  // 好的错误信息
+  TORCH_CHECK(
+      permute.is_contiguous(),
+      "invert_permute_npu: input tensor must be contiguous, got stride=",
+      permute.strides());
+
+  // 避免的错误信息（太简单）
+  TORCH_CHECK(permute.is_contiguous(), "tensor not contiguous");
+
+  // 避免的错误信息（太复杂）
+  TORCH_CHECK(
+      permute.is_contiguous(),
+      "The input tensor provided to the invert_permute operation on the NPU "
+      "device must be contiguous in memory layout, meaning that the tensor's "
+      "strides must correspond to a row-major order without any gaps or "
+      "overlaps in the underlying storage. The provided tensor has strides ",
+      permute.strides());
+
+  6.5 边界条件处理
+
+  参考AscendC样例的约束：
+
+  Tensor invert_permute_npu(const Tensor& permute) {
+    // 类型检查
+    TORCH_CHECK(
+        permute.scalar_type() == at::kInt ||
+        permute.scalar_type() == at::kLong,
+        "invert_permute_npu only supports int32 and int64, got ",
+        permute.scalar_type());
+
+    // 维度检查
+    TORCH_CHECK(
+        permute.dim() == 1,
+        "invert_permute_npu expects 1D tensor, got dim=",
+        permute.dim(),
+        ", shape=",
+        permute.sizes());
+
+    // 长度检查（参考AscendC约束）
+    int64_t length = permute.numel();
+    TORCH_CHECK(
+        length >= 1 && length <= (1L << 31),
+        "invert_permute_npu: tensor length must be in [1, 2^31], got ",
+        length);
+
+    // 空张量特殊处理
+    if (length == 0) {
+      return at::empty_like(permute);
+    }
+
+    // ... 正常逻辑
+  }
+
+  这一节的错误处理和日志设计是否合理？
+
+❯ TENSOR_ON_NPU_GPU这个命名有点奇怪，直接TENSOR_ON_NPU宏就可以了吧 
+
+● 你说得对！TENSOR_ON_NPU_GPU命名确实不合适，GPU和NPU是不同的硬件。让我修正：
+
+  6.2 NPU专用宏定义（修正版）
+
+  // fbgemm_gpu/src/npu/utils/npu_ops_utils.h
+
+  #pragma once
+
+  #include <ATen/Tensor.h>
+  #include <c10/core/DeviceType.h>
+  #include <torch/library.h>
+
+  #ifdef USE_NPU
+
+  namespace fbgemm_gpu::npu {
+
+  // 设备检查宏
+  #define TENSOR_ON_NPU(tensor)                                         \
+    TORCH_CHECK(                                                       \
+        (tensor).device().type() == c10::kPrivateUse1,                 \
+        "Tensor must be on NPU device but is on device: ",            \
+        (tensor).device());
+
+  // NPU设备保护类
+  class NPUDeviceGuard {
+    c10::Device prev_device_;
+  public:
+    explicit NPUDeviceGuard(const at::Tensor& tensor) 
+      : prev_device_(c10::current_device()) {
+      c10::set_device(tensor.device());
+    }
+
+    ~NPUDeviceGuard() {
+      c10::set_device(prev_device_);
+    }
+
+    NPUDeviceGuard(const NPUDeviceGuard&) = delete;
+    NPUDeviceGuard& operator=(const NPUDeviceGuard&) = delete;
+  };
+
+  // ACLNN错误检查宏
+  #define CHECK_NPU_CMD(cmd)                                          \
+    do {                                                              \
+      auto ret = (cmd);                                               \
+      if (ret != 0) {                                                 \
+        TORCH_CHECK(false, "NPU command failed: " #cmd ", ret=", ret); \
+      }                                                               \
+    } while(0)
+
+  } // namespace fbgemm_gpu::npu
+
+  #endif // USE_NPU
+
+  使用示例：
+  Tensor invert_permute_npu(const Tensor& permute) {
+    TENSOR_ON_NPU(permute);  // 简洁清晰
+    NPUDeviceGuard guard(permute);
+    // ...
+  }
+
+  感谢指出！命名更简洁了。这一节现在可以了吗？
+
+❯ 可以了 
+
+● 很好，继续下一章。
+
+  第七章：测试策略
+
+  7.1 测试层次结构
+
+  ┌─────────────────────────────────────────────────┐
+  │  1. 单元测试            │
+  │     - 测试单个NPU算子正确性                       │
+  │     - 验证与CUDA结果数值一致                      │
+  └─────────────────────────────────────────────────┘
+                         ↓
+  ┌─────────────────────────────────────────────────┐
+  │  2. 集成测试                 │
+  │     - 测试分发器路由逻辑                          │
+  │     - 验证多设备混合场景                          │
+  └─────────────────────────────────────────────────┘
+                         ↓
+  ┌─────────────────────────────────────────────────┐
+  │  3. 性能测试                  │
+  │     - 对比NPU vs CUDA性能                         │
+  │     - 验证Tiling参数优化效果                       │
+  └─────────────────────────────────────────────────┘
+                         ↓
+  ┌─────────────────────────────────────────────────┐
+  │  4. 端到端测试                  │
+  │     - 在推荐模型中验证                            │
+  │     - 验证训练收敛性                              │
+  └─────────────────────────────────────────────────┘
+
+  7.2 单元测试
+
+  测试目录结构：
+  fbgemm_gpu/test/npu/
+  ├── sparse_ops/
+  │   ├── test_invert_permute.py
+  │   ├── test_permute_1d.py
+  │   └── test_permute_2d.py
+  ├── quantize_ops/
+  │   ├── test_quantize.py
+  │   └── test_dequantize.py
+  └── utils/
+      ├── test_dtype_utils.py
+      └── test_device_utils.py
+
+  测试示例：
+  # test_invert_permute.py
+
+  import pytest
+  import torch
+  import torch_npu
+  import fbgemm_gpu
+
+  class TestInvertPermuteNPU:
+      """测试invert_permute算子"""
+
+      @pytest.mark.skipif(not torch.npu.is_available(), reason="NPU not 
+  available")
+      def test_invert_permute_int32(self):
+          """测试int32类型"""
+          x = torch.tensor([1, 2, 0, 3], dtype=torch.int32)
+          x_npu = x.npu()
+
+          # NPU计算
+          y_npu = torch.ops.fbgemm.invert_permute(x_npu)
+
+          # CUDA计算（参考）
+          x_cuda = x.cuda()
+          y_cuda = torch.ops.fbgemm.invert_permute(x_cuda)
+
+          # 验证结果一致
+          assert torch.equal(y_npu.cpu(), y_cuda.cpu())
+
+      @pytest.mark.skipif(not torch.npu.is_available(), reason="NPU not 
+  available")
+      def test_invert_permute_int64(self):
+          """测试int64类型"""
+          x = torch.tensor([1, 2, 0, 3], dtype=torch.int64)
+          x_npu = x.npu()
+
+          y_npu = torch.ops.fbgemm.invert_permute(x_npu)
+          y_cuda = torch.ops.fbgemm.invert_permute(x.cuda())
+
+          assert torch.equal(y_npu.cpu(), y_cuda.cpu())
+
+      @pytest.mark.skipif(not torch.npu.is_available(), reason="NPU not 
+  available")
+      def test_invert_permute_large_tensor(self):
+          """测试大张量"""
+          x = torch.arange(10000).to(torch.int32)
+          x_npu = x.npu()
+
+          y_npu = torch.ops.fbgemm.invert_permute(x_npu)
+          y_cuda = torch.ops.fbgemm.invert_permute(x.cuda())
+
+          assert torch.equal(y_npu.cpu(), y_cuda.cpu())
+
+      @pytest.mark.skipif(not torch.npu.is_available(), reason="NPU not 
+  available")
+      def test_invert_permute_empty_tensor(self):
+          """测试空张量边界条件"""
+          x = torch.tensor([], dtype=torch.int32)
+          x_npu = x.npu()
+
+          y_npu = torch.ops.fbgemm.invert_permute(x_npu)
+          y_cuda = torch.ops.fbgemm.invert_permute(x.cuda())
+
+          assert torch.equal(y_npu.cpu(), y_cuda.cpu())
+
+  7.3 集成测试
+
+  分发器路由测试：
+  # test_dispatcher.py
+
+  import pytest
+  import torch
+  import torch_npu
+
+  @pytest.mark.skipif(not torch.npu.is_available(), reason="NPU not available")
+  def test_auto_dispatch():
+      """测试自动设备路由"""
+      x = torch.tensor([1, 2, 0])
+
+      # CPU张量 → CPU实现
+      y_cpu = torch.ops.fbgemm.invert_permute(x)
+      assert y_cpu.device.type == 'cpu'
+
+      # CUDA张量 → CUDA实现
+      if torch.cuda.is_available():
+          x_cuda = x.cuda()
+          y_cuda = torch.ops.fbgemm.invert_permute(x_cuda)
+          assert y_cuda.device.type == 'cuda'
+
+      # NPU张量 → NPU实现
+      x_npu = x.npu()
+      y_npu = torch.ops.fbgemm.invert_permute(x_npu)
+      assert y_npu.device.type == 'privateuseone'
+
+      # 验证结果一致
+      assert torch.equal(y_cpu, y_npu.cpu())
+
+  7.4 性能测试
+
+  # test_performance.py
+
+  import time
+  import torch
+  import torch_npu
+
+  def benchmark_invert_permute(device, size, iterations=100):
+      """性能测试"""
+      x = torch.randn(size).to(torch.int32).to(device)
+
+      # 预热
+      for _ in range(10):
+          _ = torch.ops.fbgemm.invert_permute(x)
+
+      torch.npu.synchronize() if device.type == 'privateuseone' else
+  torch.cuda.synchronize()
+
+      # 计时
+      start = time.time()
+      for _ in range(iterations):
+          _ = torch.ops.fbgemm.invert_permute(x)
+
+      torch.npu.synchronize() if device.type == 'privateuseone' else
+  torch.cuda.synchronize()
+      elapsed = time.time() - start
+
+      return elapsed / iterations
+
+  if torch.npu.is_available() and torch.cuda.is_available():
+      sizes = [1000, 10000, 100000, 1000000]
+
+      print("Size\tNPU(ms)\tCUDA(ms)\tSpeedup")
+      for size in sizes:
+          npu_time = benchmark_invert_permute(torch.device('npu:0'), size)
+          cuda_time = benchmark_invert_permute(torch.device('cuda:0'), size)
+          speedup = cuda_time / npu_time
+
+  print(f"{size}\t{npu_time*1000:.2f}\t{cuda_time*1000:.2f}\t{speedup:.2f}x")
+
+  7.5 CI/CD集成
+
+  CI配置：
+  # .github/workflows/npu_test.yml
+
+  name: NPU Tests
+
+  on:
+    push:
+      paths:
+        - 'fbgemm_gpu/src/npu/**'
+    pull_request:
+      paths:
+        - 'fbgemm_gpu/src/npu/**'
+
+  jobs:
+    npu-tests:
+      runs-on: [self-hosted, npu]  # 需要NPU环境
+      steps:
+        - uses: actions/checkout@v3
+
+        - name: Build with NPU
+          run: |
+            cmake -B build -DUSE_NPU=ON -DCANN_PATH=/usr/local/Ascend
+            cmake --build build --target fbgemm_gpu
+
+        - name: Run NPU unit tests
+          run: |
+            python -m pytest test/npu/ -v
+
+        - name: Run integration tests
+          run: |
+            python -m pytest test/npu/integration/ -v
+
+  7.6 测试覆盖率要求
+  ┌──────────┬────────────┬──────────────────────────────────────────┐
+  │ 测试类型 │ 覆盖率要求 │                   说明                   │
+  ├──────────┼────────────┼──────────────────────────────────────────┤
+  │ 单元测试 │ 100%       │ 每个NPU算子必须有测试                    │
+  ├──────────┼────────────┼──────────────────────────────────────────┤
+  │ 类型覆盖 │ 4种类型    │ int32, int64, float, half                │
+  ├──────────┼────────────┼──────────────────────────────────────────┤
+  │ 边界条件 │ 5+场景     │ 空张量、单元素、大张量、非连续、错误输入 │
+  ├──────────┼────────────┼──────────────────────────────────────────┤
+  │ 设备路由 │ 3种设备    │ CPU, CUDA, NPU                           │
+  ├──────────┼────────────┼──────────────────────────────────────────┤
+  │ 性能对比 │ 5个规模    │ 不同规模张量的性能对比                   │
+  └──────────┴────────────┴──────────────────────────────────────────┘
+  这一节的测试策略是否合理？
+
+❯ 测试目录结构和测试策略是否和原有的FBGEMM项目一致，确认一下 
+
+● 好问题！让我检查一下FBGEMM现有的测试结构。
+
+● Bash(find /home/hsl/FBGEMM/test -name "*.py" | head -20)
+  ⎿  (No content)
+
+● Bash(find /home/hsl/FBGEMM -name "test_*.py" -o -name "*_test.py" | head -20)
+  ⎿  /home/hsl/FBGEMM/fbgemm_gpu/test/batched_unary_embeddings_test.py
+     /home/hsl/FBGEMM/fbgemm_gpu/test/utils/filestore_test.py
+     /home/hsl/FBGEMM/fbgemm_gpu/test/test_utils.py
+     … +23 lines (ctrl+o to expand)
+
+● Read(fbgemm_gpu/test/permute/permute_pooled_embedding_test.py)
+  ⎿  Read 60 lines
+
+● Read(fbgemm_gpu/test/test_utils.py)
+  ⎿  Read 100 lines
+
+● 非常好的观察！让我修正第七章以符合FBGEMM现有的测试风格：
+
+  第七章：测试策略（修正版）
+
+  7.1 测试目录结构
+
+  符合FBGEMM现有结构：
+  fbgemm_gpu/test/
+  ├── npu/                           # NPU专用测试目录（新增）
+  │   ├── sparse_ops_test.py         # 稀疏算子测试
+  │   ├── quantize_ops_test.py       # 量化算子测试
+  │   └── dispatch_test.py           # 分发器路由测试
+  ├── combine/                       # 现有测试目录
+  ├── permute/                       # 现有测试目录
+  └── test_utils.py                  # 扩展公共工具
+
+  7.2 使用unittest + Hypothesis框架
+
+  FBGEMM现有风格：
+  # fbgemm_gpu/test/npu/sparse_ops_test.py
+
+  # Copyright (c) Meta Platforms, Inc. and affiliates.
+  # All rights reserved.
+
+  import unittest
+  import hypothesis.strategies as st
+  import torch
+  from hypothesis import given, settings, Verbosity
+
+  try:
+      from fbgemm_gpu import open_source
+      from test_utils import gpu_unavailable
+  except Exception:
+      from fbgemm_gpu.test.test_utils import gpu_unavailable
+
+  # NPU不可用时的跳过装饰器
+  npu_unavailable = (
+      not hasattr(torch, 'npu') or not torch.npu.is_available(),
+      "NPU is not available"
+  )
+
+  class NPUInvertPermuteTest(unittest.TestCase):
+      """invert_permute算子的NPU测试"""
+
+      @unittest.skipIf(*npu_unavailable)
+      @given(
+          size=st.integers(min_value=1, max_value=10000),
+          dtype=st.sampled_from([torch.int32, torch.int64]),
+      )
+      @settings(verbosity=Verbosity.verbose, max_examples=20, deadline=None)
+      def test_invert_permute_correctness(self, size: int, dtype: torch.dtype) 
+  -> None:
+          """测试NPU与CUDA结果一致性"""
+          import torch_npu
+
+          # 生成输入
+          x = torch.randperm(size).to(dtype)
+
+          # CUDA计算（参考）
+          x_cuda = x.cuda()
+          y_cuda = torch.ops.fbgemm.invert_permute(x_cuda)
+
+          # NPU计算
+          x_npu = x.npu()
+          y_npu = torch.ops.fbgemm.invert_permute(x_npu)
+
+          # 验证结果一致
+          torch.testing.assert_close(
+              y_npu.cpu(),
+              y_cuda.cpu(),
+              rtol=1e-5,
+              atol=1e-5
+          )
+
+      @unittest.skipIf(*npu_unavailable)
+      def test_invert_permute_empty_tensor(self) -> None:
+          """测试空张量边界条件"""
+          x = torch.tensor([], dtype=torch.int32)
+          x_npu = x.npu()
+
+          y_npu = torch.ops.fbgemm.invert_permute(x_npu)
+          y_cuda = torch.ops.fbgemm.invert_permute(x.cuda())
+
+          torch.testing.assert_close(y_npu.cpu(), y_cuda.cpu())
+
+  7.3 扩展test_utils.py
+
+  在现有test_utils.py中添加NPU支持：
+  # fbgemm_gpu/test/test_utils.py (新增)
+
+  # NPU设备检测（与gpu_unavailable风格一致）
+  npu_unavailable: tuple[bool, str] = (
+      not hasattr(torch, 'npu') or not torch.npu.is_available(),
+      "NPU is not available"
+  )
+
+  npu_available: bool = not npu_unavailable[0]
+
+  # 多设备测试辅助函数
+  def cpu_and_maybe_gpu_npu(test_func):
+      """
+      装饰器：在CPU、CUDA（可用）、NPU（可用）上运行测试
+      与cpu_and_maybe_gpu风格一致
+      """
+      @wraps(test_func)
+      def wrapper(self, *args, **kwargs):
+          # CPU测试
+          test_func(self, *args, device=torch.device('cpu'), **kwargs)
+
+          # CUDA测试（如果可用）
+          if torch.cuda.is_available():
+              test_func(self, *args, device=torch.device('cuda:0'), **kwargs)
+
+          # NPU测试（如果可用）
+          if npu_available:
+              test_func(self, *args, device=torch.device('npu:0'), **kwargs)
+
+      return wrapper
+
+  7.4 分发器集成测试
+
+  # fbgemm_gpu/test/npu/dispatch_test.py
+
+  import unittest
+  from test_utils import npu_unavailable
+
+  class DispatcherTest(unittest.TestCase):
+      """测试自动设备路由"""
+
+      @unittest.skipIf(*npu_unavailable)
+      def test_auto_routing_npu(self) -> None:
+          """测试NPU张量自动路由到NPU实现"""
+          x = torch.tensor([1, 2, 0])
+          x_npu = x.npu()
+
+          # 应该调用NPU实现
+          y_npu = torch.ops.fbgemm.invert_permute(x_npu)
+
+          # 验证在NPU设备上
+          self.assertEqual(y_npu.device.type, 'privateuseone')
+
+      @unittest.skipIf(*npu_unavailable)
+      def test_mixed_devices(self) -> None:
+          """测试多设备混合场景"""
+          x = torch.tensor([1, 2, 0])
+
+          # CPU
+          y_cpu = torch.ops.fbgemm.invert_permute(x)
+          self.assertEqual(y_cpu.device.type, 'cpu')
+
+          # NPU
+          if torch.npu.is_available():
+              y_npu = torch.ops.fbgemm.invert_permute(x.npu())
+              self.assertEqual(y_npu.device.type, 'privateuseone')
+              torch.testing.assert_close(y_cpu, y_npu.cpu())
+
+          # CUDA（如果可用）
+          if torch.cuda.is_available():
+              y_cuda = torch.ops.fbgemm.invert_permute(x.cuda())
+              self.assertEqual(y_cuda.device.type, 'cuda')
+              torch.testing.assert_close(y_cpu, y_cuda.cpu())
+
+  7.5 性能测试（C++）
+
+  在bench/目录添加NPU性能测试：
+  // fbgemm_gpu/bench/NPUInvertPermuteBenchmark.cc
+
+  #include <benchmark/benchmark.h>
+  #include <torch/torch.h>
+  #include <ATen/Functions.h>
+
+  #ifdef USE_NPU
+  #include <torch_npu/csrc/include/npu/functions/Helper.h>
+  #endif
+
+  static void BM_InvertPermute_NPU(benchmark::State& state) {
+  #ifdef USE_NPU
+    int64_t size = state.range(0);
+    auto x = torch::randperm(size, torch::kInt32);
+
+    if (torch::npu::is_available()) {
+      x = x.to(torch::kNPU);
+
+      for (auto _ : state) {
+        auto y = torch::ops::fbgemm::invert_permute(x);
+        torch_npu::utils::npu_lazy::NpuUtils::npu_synchronize();
+      }
+    }
+  #endif
+  }
+
+  BENCHMARK(BM_InvertPermute_NPU)
+      ->Range(1000, 1000000)
+      ->Unit(benchmark::kMicrosecond);
+
+  7.6 运行测试
+
+  # 运行NPU测试
+  python -m unittest fbgemm_gpu.test.npu.sparse_ops_test
+
+  # 运行所有NPU测试
+  python -m unittest discover -s fbgemm_gpu/test/npu
+
+  # 运行NPU性能测试
+  ./bench/NPUInvertPermuteBenchmark
+
+  这一节修正后是否符合FBGEMM的测试风格？
+
+❯ 没有多设备同时部署的场景，然后gpu和npu的结果没办法在一个用例里对比 
+
+● 你说得对！我的测试设计不切实际。让我修正：
+
+  第七章：测试策略（重新设计）
+
+  7.1 现实约束
+
+  实际部署场景：
+  - GPU环境：使用CUDA实现
+  - NPU环境：使用NPU实现
+  - 没有GPU+NPU混合部署场景
+
+  测试策略调整：
+  - 不能在同一用例中对比GPU和NPU结果
+  - 需要分别验证各设备的正确性
+  - 使用黄金数据或参考算法验证
+
+  7.2 NPU测试策略
+
+  方案A：使用CPU参考验证
+  # fbgemm_gpu/test/npu/sparse_ops_test.py
+
+  import unittest
+  import hypothesis.strategies as st
+  import torch
+  from hypothesis import given, settings, Verbosity
+
+  try:
+      from test_utils import npu_unavailable
+  except Exception:
+      from fbgemm_gpu.test.test_utils import npu_unavailable
+
+  class NPUInvertPermuteTest(unittest.TestCase):
+      """NPU算子测试 - 使用CPU作为参考"""
+
+      @unittest.skipIf(*npu_unavailable)
+      @given(
+          size=st.integers(min_value=1, max_value=10000),
+          dtype=st.sampled_from([torch.int32, torch.int64]),
+      )
+      @settings(verbosity=Verbosity.verbose, max_examples=20, deadline=None)
+      def test_invert_permute_correctness(self, size: int, dtype: torch.dtype) 
+  -> None:
+          """NPU vs CPU结果对比"""
+          # 生成输入
+          x = torch.randperm(size).to(dtype)
+
+          # CPU计算（参考）
+          y_cpu = torch.ops.fbgemm.invert_permute(x)
+
+          # NPU计算
+          x_npu = x.npu()
+          y_npu = torch.ops.fbgemm.invert_permute(x_npu)
+
+          # 验证结果一致
+          torch.testing.assert_close(
+              y_npu.cpu(),
+              y_cpu,
+              rtol=1e-5,
+              atol=1e-5,
+              msg=f"NPU和CPU结果不一致"
+          )
+
+  方案B：使用黄金数据文件
+  class NPUInvertPermuteTest(unittest.TestCase):
+      """使用预生成的黄金数据验证"""
+
+      def test_invert_permute_golden_data(self) -> None:
+          """使用标准测试用例"""
+          test_cases = [
+              (torch.tensor([1, 2, 0]), torch.tensor([2, 0, 1])),
+              (torch.tensor([0, 1, 2, 3]), torch.tensor([0, 1, 2, 3])),
+              (torch.tensor([3, 1, 2, 0]), torch.tensor([3, 1, 2, 0])),
+          ]
+
+          for input_tensor, expected_output in test_cases:
+              x_npu = input_tensor.npu()
+              y_npu = torch.ops.fbgemm.invert_permute(x_npu)
+
+              torch.testing.assert_close(
+                  y_npu.cpu(),
+                  expected_output,
+                  msg=f"输入 {input_tensor} 的输出不符合预期"
+              )
+
+  7.3 GPU测试保持不变
+
+  # fbgemm_gpu/test/sparse_ops_test.py (现有测试，保持不变)
+
+  class CUDAInvertPermuteTest(unittest.TestCase):
+      """CUDA算子测试 - GPU环境使用"""
+
+      @unittest.skipIf(*gpu_unavailable)
+      @given(size=st.integers(min_value=1, max_value=10000))
+      @settings(verbosity=Verbosity.verbose, max_examples=20)
+      def test_invert_permute_correctness(self, size: int) -> None:
+          """CUDA vs CPU结果对比"""
+          x = torch.randperm(size)
+
+          y_cpu = torch.ops.fbgemm.invert_permute(x)
+          y_cuda = torch.ops.fbgemm.invert_permute(x.cuda())
+
+          torch.testing.assert_close(y_cpu, y_cuda.cpu())
+
+  7.4 CI/CD分离
+
+  不同的CI环境：
+  # GPU环境CI（现有）
+  name: GPU Tests
+  runs-on: [self-hosted, gpu]
+  steps:
+    - run: python -m unittest fbgemm_gpu.test.sparse_ops_test
+
+  # NPU环境CI（新增）
+  name: NPU Tests
+  runs-on: [self-hosted, npu]
+  steps:
+    - run: python -m unittest fbgemm_gpu.test.npu.sparse_ops_test
+
+  7.5 分发器测试
+
+  class DispatcherTest(unittest.TestCase):
+      """测试设备路由逻辑"""
+
+      @unittest.skipIf(*npu_unavailable)
+      def test_npu_routing(self) -> None:
+          """测试NPU张量路由到NPU实现"""
+          x = torch.tensor([1, 2, 0]).npu()
+          y = torch.ops.fbgemm.invert_permute(x)
+
+          # 验证输出在NPU上
+          self.assertEqual(y.device.type, 'privateuseone')
+          self.assertEqual(y.device.index, 0)
+
+      def test_cpu_routing(self) -> None:
+          """测试CPU张量路由到CPU实现"""
+          x = torch.tensor([1, 2, 0])
+          y = torch.ops.fbgemm.invert_permute(x)
+
+          self.assertEqual(y.device.type, 'cpu')
+
+  7.6 性能对比（独立运行）
+
+  不在同一测试中对比：
+  # NPU性能测试（NPU环境运行）
+  def benchmark_npu():
+      """NPU环境下的性能"""
+      x = torch.randn(10000).to(torch.int32).npu()
+
+      for _ in range(100):
+          y = torch.ops.fbgemm.invert_permute(x)
+          torch.npu.synchronize()
+
+  # GPU性能测试（GPU环境运行）
+  def benchmark_gpu():
+      """GPU环境下的性能"""
+      x = torch.randn(10000).to(torch.int32).cuda()
+
+      for _ in range(100):
+          y = torch.ops.fbgemm.invert_permute(x)
+          torch.cuda.synchronize()
+
+  性能数据单独收集和对比，不在单元测试中进行。
+
+  这一节修正后是否合理？
+
+❯ 可以 
+
+● 很好，继续最后一章。
+
+  第八章：实施路线图
+
+  8.1 总体时间规划
+
+  阶段1: 框架搭建 (2-3周)
+    ├── CMake配置
+    ├── 目录结构创建
+    ├── 分发器实现
+    └── 工具函数库
+
+  阶段2: 示例算子实现 (1-2周)
+    ├── 选取1-2个简单算子
+    ├── AscendC实现
+    ├── Wrapper实现
+    └── 单元测试
+
+  阶段3: 核心算子适配 (4-6周)
+    ├── 稀疏算子
+    ├── 量化算子
+    └── 性能优化
+
+  阶段4: 测试和验证 (2-3周)
+    ├── 完善单元测试
+    ├── 集成测试
+    └── 性能调优
+
+  阶段5: 文档和发布 (1-2周)
+    ├── 开发文档
+    ├── 用户文档
+    └── 提交PR
+
+  8.2 阶段1：框架搭建
+
+  目标：建立完整的NPU适配框架，无功能算子
+
+  任务清单：
+
+  1. CMake配置
+    - 添加USE_NPU选项
+    - CANN工具链检测
+    - 创建fbgemm_gpu/src/npu/CMakeLists.txt
+    - 创建fbgemm_gpu/src/npu/ascendc/CMakeLists.txt
+  2. 目录结构创建
+  mkdir -p fbgemm_gpu/src/npu/{dispatch,sparse_ops,quantize_ops,utils}
+  mkdir -p fbgemm_gpu/src/npu/ascendc/invert_permute/{op_host,op_kernel}
+  3. 分发器实现
+    - fbgemm_gpu/src/npu/dispatch/dispatcher.h
+    - fbgemm_gpu/src/npu/dispatch/sparse_ops.cpp
+    - 测试分发器路由逻辑
+  4. 工具函数库
+    - fbgemm_gpu/src/npu/utils/npu_ops_utils.h
+    - fbgemm_gpu/src/npu/utils/npu_type_utils.h
+    - TENSOR_ON_NPU宏
+    - NPUDeviceGuard类
+  5. 测试框架
+    - 创建fbgemm_gpu/test/npu/目录
+    - 扩展test_utils.py添加npu_unavailable
+    - 创建CI配置模板
+
+  验收标准：
+  - ✅ cmake -DUSE_NPU=ON可以成功配置
+  - ✅ 编译生成libfbgemm_npu_wrapper.a
+  - ✅ 分发器可以正确路由CPU张量
+
+  8.3 阶段2：示例算子实现
+
+  目标：实现1-2个简单算子，验证完整流程
+
+  选择算子：invert_permute（简单、无状态）
+
+  任务清单：
+
+  1. AscendC实现
+    - op_host/invert_permute.cpp
+    - op_host/invert_permute_tiling.h
+    - op_kernel/invert_permute.cpp
+    - op_kernel/invert_permute_kernel.h
+    - 独立编译测试
+  2. NPU Wrapper实现
+    - sparse_ops/invert_permute.cpp
+    - 类型调度（int32/int64）
+    - 边界检查
+  3. 分发器集成
+    - 在dispatcher.h中声明
+    - 在sparse_ops.cpp中注册
+  4. 单元测试
+    - 正确性测试（vs CPU）
+    - 边界条件测试
+    - 错误处理测试
+
+  验收标准：
+  - ✅ torch.ops.fbgemm.invert_permute(npu_tensor)正确执行
+  - ✅ 单元测试通过率100%
+  - ✅ 与CPU结果数值一致
+
+  8.4 阶段3：核心算子适配
+
+  目标：适配推荐系统核心算子
+
+  优先级排序：
+  ┌────────┬───────────┬────────────────────────┬────────┐
+  │ 优先级 │ 算子类型  │        典型算子        │ 复杂度 │
+  ├────────┼───────────┼────────────────────────┼────────┤
+  │ P0     │ 稀疏算子  │ permute_1d, permute_2d │ 低     │
+  ├────────┼───────────┼────────────────────────┼────────┤
+  │ P0     │ 稀疏算子  │ index_select_dim0      │ 中     │
+  ├────────┼───────────┼────────────────────────┼────────┤
+  │ P1     │ 稀疏算子  │ pack_segments          │ 中     │
+  ├────────┼───────────┼────────────────────────┼────────┤
+  │ P1     │ 量化算子  │ quantize, dequantize   │ 低     │
+  ├────────┼───────────┼────────────────────────┼────────┤
+  │ P2     │ Embedding │ split_embedding_lookup │ 高     │
+  └────────┴───────────┴────────────────────────┴────────┘
+  并行开发策略：
+  - 昇腾团队：2-3人并行开发不同算子
+  - 每完成一个算子立即提交测试
+  - 每周同步进度和问题
+
+  8.5 阶段4：测试和验证
+
+  目标：确保质量和性能
+
+  任务清单：
+
+  1. 单元测试完善
+    - 每个算子覆盖4种类型
+    - 边界条件测试
+    - 错误输入测试
+  2. 集成测试
+    - 分发器路由测试
+    - 多算子组合测试
+    - 端到端场景测试
+  3. 性能测试
+    - 不同数据规模测试
+    - Tiling参数调优
+    - vs CPU性能对比
+  4. CI/CD集成
+    - NPU CI环境配置
+    - 自动化测试流程
+    - 性能回归检测
+
+  验收标准：
+  - ✅ 单元测试覆盖率 > 90%
+  - ✅ 所有集成测试通过
+  - ✅ 性能达到预期目标
+
+  8.6 阶段5：文档和发布
+
+  目标：准备合入主分支
+
+  任务清单：
+
+  1. 开发文档
+    - 架构设计文档
+    - 编译指南
+    - 算子开发指南
+    - 调试指南
+  2. 用户文档
+    - NPU支持说明
+    - 安装指南
+    - 迁移指南（CUDA→NPU）
+  3. 代码审查准备
+    - 清理临时代码
+    - 代码注释完善
+    - 合入commit message规范
+  4. 提交PR
+    - 分拆为多个小PR（按模块）
+    - 每个PR独立可测试
+    - 提供详细的变更说明
+
+  8.7 风险和应对
+  ┌───────────────────┬──────┬──────┬───────────────────────────────┐
+  │       风险        │ 影响 │ 概率 │           应对措施            │
+  ├───────────────────┼──────┼──────┼───────────────────────────────┤
+  │ AscendC工具链问题 │ 高   │ 中   │ 提前验证工具链，准备备选方案  │
+  ├───────────────────┼──────┼──────┼───────────────────────────────┤
+  │ 性能不达标        │ 高   │ 中   │ 预留性能优化时间，邀请NPU专家 │
+  ├───────────────────┼──────┼──────┼───────────────────────────────┤
+  │ 与FBGEMM设计冲突  │ 中   │ 低   │ 早期与FBGEMM团队对齐设计      │
+  ├───────────────────┼──────┼──────┼───────────────────────────────┤
+  │ CI环境不稳定      │ 中   │ 中   │ 建立稳定的NPU测试环境         │
+  ├───────────────────┼──────┼──────┼───────────────────────────────┤
+  │ 资源不足          │ 高   │ 低   │ 合理规划优先级，聚焦核心算子  │
+  └───────────────────┴──────┴──────┴───────────────────────────────┘
+  8.8 成功标准
+
+  框架合入标准：
+  - ✅ 零侵入现有CUDA/CPU代码
+  - ✅ 编译可选（USE_NPU=OFF不影响）
+  - ✅ 代码符合FBGEMM规范
+  - ✅ 通过所有CI测试
+
+  功能完成标准（MVP）：
+  - ✅ 支持5个核心稀疏算子
+  - ✅ 支持2个量化算子
+  - ✅ 单元测试覆盖率 > 90%
+  - ✅ 在实际模型中验证通过
+
+  ---
+  设计文档的所有章节已完成。是否需要我将完整文档整理输出？
+
+❯ 好的，整理文档输出 
+
+● Bash(date +%Y-%m-%d)
+  ⎿  2026-01-24
+
+● Write(docs/plans/2026-01-24-npu-adaptation-design.md)
+  ⎿  Wrote 1147 lines to docs/plans/2026-01-24-npu-adaptation-design.md
+      1 # FBGEMM_GPU昇腾NPU适配方案设计文档
+      2 **项目**: FBGEMM_GPU Ascend NPU Backend Adaptation
+      3 **日期**: 2026-01-24
+      4 **版本**: v1.0
+      5 **状态**: 设计阶段
+      6 ---
+      7 ## 文档修订历史
+     … +1137 lines (ctrl+o to expand)
+
+● 完成！设计文档已整理输出到：
+
+  📄 docs/plans/2026-01-24-npu-adaptation-design.md
+
+  文档包含内容：
+
+  核心章节
+
+  1. 总体架构设计 - 设计目标、分层架构、目录组织
+  2. 核心组件设计 - 分发器、三层架构、Tiling机制
+  3. 编译系统设计 - 两阶段编译、CMake配置
+  4. 类型系统设计 - 类型映射、工具函数
+  5. 算子注册和分发机制 - 与CUDA保持一致
+  6. 错误处理和日志 - 错误处理策略、日志系统
+  7. 测试策略 - unittest框架、CI/CD分离
+  8. 实施路线图 - 5阶段实施计划、风险应对
+
+  附录
+
+  - 参考文档
+  - 术语表
+  - 联系方式
+
+  关键设计亮点：
+
+  ✅ 零侵入 - 不修改现有CUDA/CPU代码
+  ✅ 完全解耦 - NPU代码独立，便于并行开发
+  ✅ 性能优先 - C++层分发，开销~10ns
+  ✅ 易于合入 - 符合FBGEMM规范，owner审查成本低
+  ✅ 可选依赖 - 默认关闭，不影响其他开发者
+
+  文档已准备就绪，可以作为后续实施的蓝图！
+╭─── Claude Code v2.1.17 ──────────────────────────────────────────────────────╮
+│                                    │ Tips for getting started                │
+│            Welcome back!           │ Run /init to create a CLAUDE.md file w… │
+│                                    │ ─────────────────────────────────────── │
+│               ▐▛███▜▌              │ Recent activity                         │
+│              ▝▜█████▛▘             │ No recent activity                      │
+│                ▘▘ ▝▝               │                                         │
+│                                    │                                         │
+│   Sonnet 4.5 · API Usage Billing   │                                         │
+│          /home/hsl/FBGEMM          │                                         │
+╰──────────────────────────────────────────────────────────────────────────────╯
+
+  /model to try Opus 4.5
+
+❯ /brainstorming 我想基于FBGEMM_GPU模块适配昇腾AscendC算子。这是算子实现样例，ht
+tps://gitcode.com/Ascend/RecSDK/tree/develop/cust_op。 设计一个详细的适配方案，
+保证FBGEMM_GPU原有的编译流程和代码架构不变，做到解耦。输出适配的方案设计文档。 
+
+● 我来帮你设计FBGEMM_GPU适配昇腾AscendC算子的方案。首先让我了解一下当前项目情况
+  和参考样例。
+
+● 🌐 Z.ai Built-in Tool: webReader
+
+  Input:
+  {"url":"https://gitcode.com/Ascend/RecSDK/tree/develop/cust_op"}
+
+  Executing on server...
+
+● Output:
+  webReader_result_summary: [{"text": {"title": "AtomGit | GitCode -
+  全球开发者的开源社区,开源代码托管平台", "description": "AtomGit |
+  GitCode是面向全球开发者的开源社区,包括原创博客,开源代码托管,代码协作,项目管理
+  等。与开发者社区互动,提升您的研发效率和质量。", "url":
+  "https://gitcode.com/Ascend/RecSDK/tree/develop/cust_op", "content": "AtomGit
+  | GitCode - 全球开发者的开源社区,开源代码托管平台\n\n![Image 1: favicon](h...
+
+● 我注意到网页抓取没有获取到具体的算子实现样例内容。让我先了解当前FBGEMM_GPU项目
+  的结构，以便更好地设计适配方案。
+
+● Explore(探索FBGEMM_GPU项目结构)
+  ⎿  Done (36 tool uses · 0 tokens · 1m 25s)
+
+● 非常好！我已经了解了FBGEMM_GPU的项目结构。这是一个成熟的GPU算子库，已经有对CPU
+  、CUDA和ROCm的多硬件后端支持，并且已经预留了fbgemm_npu_ops/目录。
+
+  我注意到参考样例链接未能获取到具体代码内容。让我逐步了解你的需求：
+
+  第一个问题： 关于昇腾AscendC算子，你是否有本地的样例代码可以分享？或者能否描述
+  一下AscendC算子的以下特点：
+
+  1. 编程接口风格 - AscendC是类似CUDA的C++接口，还是其他风格？
+  2. 编译方式 - AscendC算子是如何编译的？需要特定的编译器吗？
+  3. 算子类型 - 你主要想适配哪类算子？例如：
+    - GEMM/矩阵乘法
+    - Embedding查找
+    - 量化/反量化
+    - 其他特定算子
+
+  如果方便，也可以直接提供AscendC样例的关键代码片段或文件，这样我能更好地理解适
+  配目标。
+
+❯ /home/hsl/RecSDK/cust_op目录是ascendc代码样例，包含了算子kernel实现和接口 
+  注册逻辑、以及编译流程                                                    
+
+● 好的，让我探索一下本地的AscendC代码样例来理解实现模式。
+
+● Explore(探索AscendC算子样例代码)
+  ⎿  Done (30 tool uses · 0 tokens · 1m 53s)
+
+● 非常好！现在我已经了解了AscendC的实现模式：
+
+  AscendC架构特点：
+  - 双层架构：Ascend C Kernel层 + PyTorch适配层
+  - 使用msopgen工具生成框架代码
+  - 通过ACLNN API调用底层kernel
+  - 编译生成.so文件，PyTorch动态加载
+  - 使用TORCH_LIBRARY宏注册算子
+
+  FBGEMM_GPU架构特点：
+  - CMake构建系统，已有CPU/CUDA/ROCm支持
+  - 完善的DISPATCH宏调度系统
+  - 模板化代码生成
+  - 已预留fbgemm_npu_ops/目录
+
+  第二个问题： 关于适配的范围和优先级，你希望：
+
+  A. 全面适配 - 适配FBGEMM_GPU中所有算子到NPU（工作量大，需要逐步实现）
+
+  B. 重点算子适配 - 优先适配关键算子，例如：
+  - Embedding相关算子（推荐系统核心）
+  - 量化/反量化算子
+  - GEMM/矩阵运算
+  - 其他你指定的算子类型
+
+  C. 框架搭建 - 先建立完整的适配框架和编译流程，后续逐步添加具体算子实现
+
+  D. 其他方案 - 你有其他特定的适配范围考虑
+
+  请选择或描述你的优先级考虑。
+
+❯ <ide_opened_file>The user opened the file /home/hsl/FBGEMM/LICENSE in the 
+  IDE. This may or may not be related to the current                        
+  task.</ide_opened_file>                                                   
+
+❯ 优先实现C，把整体框架搭建起来。 
+
+● 好的，选择C方案 -
+  先搭建完整框架。这是一个很好的策略，可以建立稳固的基础后再逐步添加算子。
+
+  第三个问题： 关于NPU算子的编译流程集成方式，FBGEMM_GPU使用CMake构建系统，而Asc
+  endC样例使用独立的run.sh和build.sh脚本。你希望：
+
+  A. 完全独立编译（推荐） -
+  NPU算子保持独立的编译流程，生成独立的.so文件，在运行时动态加载。这种方式：
+  - 优点：完全解耦，不破坏FBGEMM原有编译流程，AscendC工具链独立
+  - 实现：在fbgemm_npu_ops/下建立独立的CMake构建系统
+
+  B. 集成到主CMake -
+  将NPU算子编译集成到FBGEMM_GPU的主CMakeLists.txt中。这种方式：
+  - 优点：统一构建，一次编译所有后端
+  - 缺点：需要修改主CMake逻辑，引入AscendC工具链依赖
+
+  C. 混合方式 - 提供两种编译选项：
+  - 开发阶段：独立编译快速迭代
+  - 发布阶段：可集成到主构建系统
+
+  你倾向于哪种方式？
+
+❯ 倾向于B。然后fbgemm_npu_ops目录是我自己创建的，不是项目本身就存在的目录， 
+  我已经删除了，忘记这个目录的存在。方案不用考虑这个目录。                  
+
+● 好的，明确了：使用B方案集成到主CMake，不考虑fbgemm_npu_ops目录。
+
+  第四个问题： 关于NPU算子的代码组织方式，参考FBGEMM_GPU现有的结构（如sparse_ops
+  /、quantize_ops/等目录）和AscendC样例的双层架构（Ascend C Kernel +
+  PyTorch适配层），你希望：
+
+  A. 分离式架构（推荐） -
+  在fbgemm_gpu/src/下创建独立的NPU算子目录，每个算子包含：
+  - ascendc/ - Ascend C kernel实现（.cpp）
+  - torch/ - PyTorch适配层实现
+  - 类似现有的split_embeddings_cache/结构
+
+  B. 内嵌式架构 - 在现有算子目录内添加NPU实现：
+  - 例如在sparse_ops/下添加sparse_ops_npu.cu
+  - 通过宏条件编译区分CUDA/NPU
+
+  C. 扁平化架构 - 在fbgemm_gpu/src/下创建统一的npu/目录：
+  - npu/kernels/ - 所有NPU kernel
+  - npu/pytorch/ - 所有PyTorch适配
+  - 按功能模块组织子目录
+
+  你倾向于哪种代码组织方式？这会影响后续的编译配置和代码结构。
+
+❯ 你觉得哪种方式更适合FBGEMM项目的硬件解耦和软件演进，需要考虑项目owner更愿 
+  意哪种方式让我合入。FBGEMM项目和昇腾算子适配是两个独立的团队              
+
+● 基于对FBGEMM项目现有架构的分析，我建议采用 C. 扁平化架构，原因如下：
+
+  为什么C方案最容易被接受：
+
+  1. 符合FBGEMM的演进模式
+  - ROCm是通过HIPify工具链自动转换，没有单独的目录
+  - 但NPU无法通过工具链自动转换（AscendC是不同的编程模型）
+  - 扁平化的npu/目录明确表明"这是需要单独维护的硬件后端"
+
+  2. 最小化侵入性
+  - 不修改现有CUDA/CPU代码文件（避免大量merge冲突）
+  - 通过调度宏在运行时路由到NPU实现
+  - 现有开发者可以完全忽略NPU代码
+
+  3. 便于独立团队协作
+  - 昇腾团队拥有独立的npu/目录，自主开发
+  - FBGEMM owner只需review调度逻辑的修改
+  - 代码边界清晰，责任划分明确
+
+  4. 与现有模式兼容
+  - 延续src/目录下按功能模块的组织方式
+  - 通过USE_NPU宏进行条件编译（类似USE_ROCM）
+
+  这个方向可以吗？我可以继续深入设计具体的技术架构。
+
+❯ 那就采用方案C 
+
+● 好的，采用C方案 - 扁平化架构。
+
+  第五个问题： 关于算子接口的注册和路由方式，参考AscendC样例使用torch.ops.mxrec
+  命名空间，而FBGEMM使用fbgemm命名空间。你希望：
+
+  A. 扩展fbgemm命名空间（推荐） - 在现有的fbgemm命名空间下注册NPU实现：
+  TORCH_LIBRARY_IMPL(fbgemm, PrivateUse1, m) {
+      m.impl("invert_permute", &invert_permute_npu);
+  }
+     PyTorch代码中统一使用：torch.ops.fbgemm.xxx()
+
+  B. 独立命名空间 - 创建独立的命名空间（如fbgemm_npu或mxrec）：
+  TORCH_LIBRARY_IMPL(fbgemm_npu, PrivateUse1, m) {
+      m.impl("invert_permute", &invert_permute_npu);
+  }
+     调用时需要区分：torch.ops.fbgemm_npu.xxx()
+
+  C. 混合方式 - 提供两种接口，既有fbgemm也有独立命名空间，便于迁移
+
+  这会影响上层PyTorch代码的调用方式和API一致性。你倾向于哪种？
+
+❯ 方案A. 扩展fbgemm命名空间 
+
+● 好的，扩展fbgemm命名空间，这样上层PyTorch代码可以无缝切换硬件后端。
+
+  第六个问题： 关于硬件后端的选择和调度机制，FBGEMM目前使用设备类型来区分CPU/GPU
+  。对于NPU（torch_npu使用PrivateUse1设备类型），你希望：
+
+  A. 自动设备检测（推荐） - 根据张量所在设备自动选择后端：
+  # 张量在NPU上自动使用NPU算子
+  x_npu = tensor.to('npu:0')
+  torch.ops.fbgemm.some_op(x_npu)  # 自动路由到NPU实现
+
+  B. 显式环境变量控制 - 通过环境变量强制选择后端：
+  export FBGEMM_BACKEND=npu  # 优先使用NPU
+     便于调试和性能对比
+
+  C. 混合方式 - 默认自动检测，支持环境变量覆盖：
+  - 优先级：环境变量 > 设备类型 > 默认后端
+  - 便于灵活切换和A/B测试
+
+  你倾向于哪种调度策略？
+
+❯ 方案A，自动设备检测 
+
+● 好的，自动设备检测，这样用户无需关心底层硬件。
+
+  第七个问题： 关于NPU工具链的依赖管理和编译配置，AscendC需要特定的工具链（如CAN
+  N、msopgen、AscendC编译器），但不是所有开发者都会安装这些。你希望：
+
+  A. 可选依赖（推荐） - NPU作为可选的后端，默认关闭：
+  option(USE_NPU "Build with Ascend NPU support" OFF)
+  - 只有显式开启才检查NPU工具链
+  - 不影响不使用NPU的开发者
+
+  B. 自动检测 - CMake自动检测系统是否有NPU工具链：
+  find_package(CANN QUIET)
+  if(CANN_FOUND)
+      set(USE_NPU ON)
+  endif()
+  - 有工具链就自动启用
+
+  C. 预配置场景 - 提供多种预设配置：
+  cmake -DCMAKE_BUILD_TYPE=Release -DUSE_NPU=ON -DCANN_PATH=/usr/local/Ascend
+  - 文档中提供标准配置模板
+
+  这会影响其他开发者的使用体验。你倾向于哪种？
+
+❯ 方案A，可选依赖 
+
+● 好的，NPU作为可选依赖，默认关闭。
+
+  第八个问题： 关于算子实现的选择逻辑，FBGEMM现有CUDA算子使用DISPATCH宏进行类型
+  调度。对于NPU，你希望：
+
+  A. 独立的NPU算子入口（推荐） - NPU算子有独立的实现函数，在Python层选择：
+  // fbgemm_gpu/src/npu/sparse_ops/invert_permute.cpp
+  Tensor invert_permute_npu(const Tensor& x) {
+      // NPU专用实现
+  }
+
+  // Python层
+  def invert_permute(x):
+      if x.is_npu:
+          return torch.ops.fbgemm.invert_permute_npu(x)
+      else:
+          return torch.ops.fbgemm.invert_permute_cuda(x)
+
+  B. 在DISPATCH宏中集成 - 扩展现有DISPATCH宏，在C++层选择：
+  DISPATCH_INVERT_PERMUTE(x, [&] {
+      if (x.is_npu()) {
+          return invert_permute_npu_impl<scalar_t>(x);
+      } else {
+          return invert_permute_cuda_impl<scalar_t>(x);
+      }
+  });
+
+  C. 统一接口分发器 - 创建分发层统一管理：
+  Tensor invert_permute(const Tensor& x) {
+      if (x.is_npu()) {
+          return invert_permute_npu(x);
+      }
+      return invert_permute_cuda(x);
+  }
+
+  这会影响代码的可维护性和性能。你倾向于哪种？
+
+❯ 哪种方案的可维护性和性能最好？ 
+
+● 从可维护性和性能两个角度分析：
+
+  性能对比
+  ┌──────────────────┬────────────────────────────────┐
+  │       方案       │            性能开销            │
+  ├──────────────────┼────────────────────────────────┤
+  │ A - Python层分发 │ +~1-5μs（Python→C++调用）      │
+  ├──────────────────┼────────────────────────────────┤
+  │ B - DISPATCH宏内 │ +~10ns（if判断，可忽略）       │
+  ├──────────────────┼────────────────────────────────┤
+  │ C - C++分发器    │ +~10ns（函数指针调用，可忽略） │
+  └──────────────────┴────────────────────────────────┘
+  性能差异：B ≈ C >> A，但相比算子执行时间（通常毫秒级），这个差异可忽略。
+
+  可维护性对比
+  ┌──────────────────┬─────────────────────┬─────────────────────────────────┐
+  │       方案       │      可维护性       │       FBGEMM owner接受度        │
+  ├──────────────────┼─────────────────────┼─────────────────────────────────┤
+  │ A - 独立入口     │ ⭐⭐⭐⭐⭐ 完全解耦 │ ⭐⭐⭐⭐⭐ 不改现有代码         │
+  ├──────────────────┼─────────────────────┼─────────────────────────────────┤
+  │ B - 集成DISPATCH │ ⭐⭐ 污染CUDA代码   │ ⭐ 需改大量现有文件             │
+  ├──────────────────┼─────────────────────┼─────────────────────────────────┤
+  │ C - 统一分发器   │ ⭐⭐⭐⭐ 清晰的分层 │ ⭐⭐⭐⭐ 新增代码，不修改旧代码 │
+  └──────────────────┴─────────────────────┴─────────────────────────────────┘
+  最佳推荐：方案C - 统一接口分发器
+
+  理由：
+  1. 性能优秀：C++层分发，开销可忽略
+  2. 可维护性高：分发逻辑集中，易于理解和修改
+  3. 解耦彻底：不修改现有CUDA/CPU代码
+  4. 易于合入：FBGEMM owner只需review新增的分发器代码
+  5. 灵活性好：便于未来添加更多硬件后端
+
+  示例代码结构：
+  // fbgemm_gpu/src/npu/dispatch/dispatcher.h
+  Tensor invert_permute(const Tensor& x) {
+      if (x.is_npu()) {
+          return invert_permute_npu(x);
+      }
+      return invert_permute_cuda(x);  // 现有实现
+  }
+
+  你认同方案C吗？
+
+❯ 提供三种方案的示例代码，我再选择 
+
+● 好的，让我先查看FBGEMM现有的算子实现，然后给出三种方案的具体示例代码。
+
+● Search(pattern: "FBGEMM_DISPATCH|DISPATCH_", head_limit: 10)
+  ⎿  Found 10 files (ctrl+o to expand)
+
+● Bash(ls -la /home/hsl/FBGEMM/fbgemm_gpu/src/sparse_ops/)
+  ⎿  total 488
+     drwxr-xr-x.  2 root root   4096 Jan 23 20:10 .
+     drwxr-xr-x. 23 root root   4096 Jan 23 22:31 ..
+     … +41 lines (ctrl+o to expand)
+
+● Read(fbgemm_gpu/src/sparse_ops/sparse_ops_gpu.cpp)
+  ⎿  Read 672 lines
+
+● Search(pattern: "FBGEMM_OP_DISPATCH", output_mode: "content")
+  ⎿  Found 432 lines (ctrl+o to expand)
+
+● Bash(ls -la /home/hsl/FBGEMM/include/fbgemm_gpu/)
+  ⎿  Error: Exit code 2
+     ls: cannot access '/home/hsl/FBGEMM/include/fbgemm_gpu/': No such file or 
+     directory
+
+● Search(pattern: "define FBGEMM_OP_DISPATCH", path: "/home/hsl/FBGEMM",
+        output_mode: "content", head_limit: 10)
+  ⎿  Found 6 lines (ctrl+o to expand)
+
+● 现在我理解了完整的架构，让我给出三种方案的详细示例代码。我会以invert_permute算
+  子为例：
+
+● Write(docs/NPU适配方案对比.md)
+  ⎿  Wrote 433 lines to docs/NPU适配方案对比.md
+      1 # NPU适配方案对比 - 以invert_permute算子为例
+      2 ## 前置条件：现有CUDA实现
+      3 **文件位置**: `fbgemm_gpu/src/sparse_ops/sparse_invert_permute.cu
+        `
+      4 ```cpp
+      5 namespace fbgemm_gpu {
+      6 template <typename index_t>
+     … +423 lines (ctrl+o to expand)
+
+● 我已经为你准备了三种方案的详细示例代码，保存在 docs/NPU适配方案对比.md。
+
+  快速总结
+
+  方案A: 独立的NPU算子入口 (Python层分发)
+
+  - 性能: +1-5μs
+  - 特点: 完全解耦，独立开发
+  - 缺点: Python层有调用开销
+
+  方案B: 在DISPATCH宏中集成 (C++层集成)
+
+  - 性能: +10ns（几乎无开销）
+  - 特点: 性能最优
+  - 缺点: 高度侵入现有代码，需要修改所有CUDA实现文件，不符合独立团队协作模式
+
+  方案C: 统一接口分发器 (推荐)
+
+  - 性能: +10ns（几乎无开销）
+  - 特点: 性能优秀 + 完全解耦 + 清晰分层
+  - 优势: 易于扩展、便于合入、支持独立团队协作
+
+  三种方案都有完整的代码示例，包括：
+  - 目录结构
+  - NPU算子实现
+  - PyTorch绑定
+  - 用户调用方式
+  - 优缺点分析
+
+  请查看文档后选择你倾向的方案。
+
+❯ <ide_opened_file>The user opened the file                                 
+  /home/hsl/FBGEMM/docs/NPU适配方案对比.md in the IDE. This may or may not  
+  be related to the current task.</ide_opened_file>                         
+
+❯ 选择方案C统一接口分发器 
+
+● 很好，选择方案C - 统一接口分发器。
+
+● 第九个问题： 关于AscendC Kernel的编译和链接方式，参考样例使用了msopgen工具生成
+  框架代码并独立编译。你希望：
+
+  A. 两阶段编译（推荐） - AscendC kernel独立编译成.so，运行时动态加载：
+  # 阶段1: 编译AscendC算子
+  add_library(ascendc_invert_permute SHARED
+      ascendc_kernels/invert_permute.ascendc
+  )
+
+  # 阶段2: NPU wrapper链接AscendC算子库
+  target_link_libraries(fbgemm_npu PRIVATE
+      ascendc_invert_permute
+      aclnn_lib  # Ascend ACLNN API
+  )
+  - 优点：AscendC工具链独立，可以单独调试和优化
+  - 符合AscendC样例的编译模式
+
+  B. 统一编译 - 将AscendC代码直接编译进FBGEMM主库：
+  # 一次性编译所有代码
+  add_library(fbgemm_gpu SHARED
+      ${CUDA_SOURCES}
+      ${NPU_SOURCES}
+      ${ASCENDC_SOURCES}
+  )
+  - 优点：单一库文件，部署简单
+  - 缺点：需要配置AscendC编译器到主CMake
+
+  C. 混合方式 - 提供两种编译模式：
+  - 开发时：两阶段编译，快速迭代
+  - 发布时：可选择统一编译
+
+  你倾向于哪种编译方式？
+
+❯ 和之前的问题一样，你觉得哪种方式更适合FBGEMM项目的硬件解耦和软件演进，需  
+  要考虑项目owner更愿意哪种方式让我合入。                                   
+
+● 从FBGEMM项目owner的角度分析，我强烈推荐 方案A - 两阶段编译。
+
+  为什么方案A最容易被接受
+
+  1. 零侵入主CMake
+
+  - AscendC编译器工具链完全隔离
+  - 不修改fbgemm_gpu/CMakeLists.txt的核心逻辑
+  - 只需在NPU目录下添加独立的编译配置
+  - FBGEMM owner审查时只需关注NPU wrapper部分
+
+  2. 符合AscendC生态标准
+
+  - AscendC样例本身就是独立编译模式
+  - 昇腾团队可以复用现有工具链和脚本
+  - 无需重新设计AscendC的编译流程
+
+  3. 独立迭代能力
+
+  昇腾团队独立开发流程：
+  1. 修改AscendC kernel → 独立编译 → 测试 → 优化
+  2. 不影响FBGEMM主代码
+  3. 准备好后再提交PR
+
+  4. 依赖管理清晰
+
+  # FBGEMM主库无NPU依赖
+  add_library(fbgemm_gpu SHARED ${CUDA_SOURCES})
+
+  # NPU支持是可选的
+  if(USE_NPU AND ASCENDC_FOUND)
+      add_subdirectory(src/npu)
+      target_link_libraries(fbgemm_gpu PRIVATE fbgemm_npu_wrapper)
+  endif()
+
+  5. 部署灵活性
+
+  - 可以提供预编译的AscendC算子包
+  - 用户按需安装NPU支持
+  - 不强制所有用户安装AscendC工具链
+
+  对比其他方案
+  ┌──────────────┬───────┬───────┬───────┐
+  │     维度     │ 方案A │ 方案B │ 方案C │
+  ├──────────────┼───────┼───────┼───────┤
+  │ 主CMake修改  │ 最小  │ 大    │ 中    │
+  ├──────────────┼───────┼───────┼───────┤
+  │ 工具链侵入性 │ 无    │ 高    │ 中    │
+  ├──────────────┼───────┼───────┼───────┤
+  │ 审查负担     │ 低    │ 高    │ 中    │
+  ├──────────────┼───────┼───────┼───────┤
+  │ 合入难度     │ 低    │ 高    │ 中    │
+  └──────────────┴───────┴───────┴───────┘
+  实际案例参考
+
+  FBGEMM现有的ROCm支持也是类似思路：
+  - ROCm通过HIPify工具链独立处理
+  - 不直接在主CMake中集成ROCm编译器
+  - 保持主构建系统的简洁性
+
+  结论：方案A是最佳选择。
+
+  你认同方案A吗？
+
+❯ 好，选用方案A 
+
+● 好的，选用方案A - 两阶段编译。
+
+● 第十个问题：
+  关于类型调度系统，FBGEMM使用AT_DISPATCH_INDEX_TYPES、FBGEMM_DISPATCH_FLOAT_AND
+  _HALF等宏进行编译时类型多态。AscendC算子通常也有类似的类型支持机制。你希望：
+
+  A. 映射到FBGEMM类型系统（推荐） - 在NPU wrapper中复用FBGEMM的DISPATCH宏：
+  Tensor invert_permute_npu(const Tensor& permute) {
+      // 复用FBGEMM的类型调度系统
+      AT_DISPATCH_INDEX_TYPES(permute.scalar_type(), "invert_permute_npu", [&] {
+          invert_permute_npu_impl<index_t>(permute);
+      });
+  }
+
+  template <typename index_t>
+  void invert_permute_npu_impl(const Tensor& permute) {
+      // 调用对应的AscendC算子实例
+      if constexpr (std::is_same_v<index_t, int32_t>) {
+          EXEC_NPU_CMD(aclnnInvertPermuteInt32, ...);
+      } else if constexpr (std::is_same_v<index_t, int64_t>) {
+          EXEC_NPU_CMD(aclnnInvertPermuteInt64, ...);
+      }
+  }
+  - 优点：保持FBGEMM的编程模型一致
+  - NPU开发者可以理解FBGEMM的类型系统
+
+  B. 独立的NPU类型系统 - AscendC算子自己管理类型：
+  Tensor invert_permute_npu(const Tensor& permute) {
+      // NPU自己处理类型转换和调度
+      auto dtype = get_ascendc_dtype(permute.scalar_type());
+      ascendc_invert_permute(dtype, ...);
+  }
+  - 优点：AscendC算子完全独立
+  - 缺点：类型系统不一致，可能有性能损失
+
+  C. 混合方式 - 提供两层抽象：
+  - 外层：FBGEMM DISPATCH宏
+  - 内层：AscendC类型映射
+
+  你倾向于哪种类型处理方式？
+
+❯ 方案A. 映射到FBGEMM类型系统 
+
+● 好的，映射到FBGEMM类型系统。现在我已经收集了所有关键的设计决策，可以开始呈现完
+  整的技术架构设计了。
+
+  现在开始呈现设计文档，我会分章节进行，每节200-300字左右。
+
+  第一章：总体架构设计
+
+  1.1 设计目标
+
+  FBGEMM_GPU昇腾NPU适配框架的核心目标是：在不破坏现有代码结构和编译流程的前提下
+  ，提供完整的NPU后端支持。关键设计原则包括：
+
+  1. 完全解耦：NPU代码独立于CUDA/CPU实现，昇腾团队可以自主开发维护
+  2. 零侵入：不修改现有CUDA/CPU源文件，通过分发器实现路由
+  3. 性能优先：C++层分发保证最小开销（~10ns）
+  4. 渐进式集成：NPU作为可选后端，默认关闭，不影响其他开发者
+
+  1.2 分层架构
+
+  采用四层架构设计，从上到下依次为：
+
+  ┌─────────────────────────────────────────┐
+  │  PyTorch用户层                           │
+  │  torch.ops.fbgemm.xxx(tensor)           │
+  └──────────────┬──────────────────────────┘
+                 │ 自动设备检测
+  ┌──────────────▼──────────────────────────┐
+  │  统一分发层 (Dispatcher)                 │
+  │  根据tensor.device()路由到对应后端       │
+  └──────────────┬──────────────────────────┘
+                 │
+       ┌─────────┼─────────┬─────────┐
+       │         │         │         │
+  ┌────▼───┐ ┌──▼────┐ ┌──▼────┐ ┌──▼────┐
+  │ CUDA   │ │  CPU  │ │  NPU   │ │ ROCm  │
+  │ 实现   │ │ 实现  │ │ 实现   │ │ 实现  │
+  └────────┘ └───────┘ └───────┘ └───────┘
+
+  1.3 目录组织
+
+  fbgemm_gpu/
+  ├── src/
+  │   ├── sparse_ops/           # 现有CUDA实现（不变）
+  │   ├── npu/                  # NPU后端（新增）
+  │   │   ├── dispatch/         # 分发器层
+  │   │   ├── sparse_ops/       # NPU算子实现
+  │   │   ├── quantize_ops/     # NPU量化算子
+  │   │   ├── utils/            # NPU工具函数
+  │   │   ├── ascendc/          # AscendC kernel（独立编译）
+  │   │   └── CMakeLists.txt    # NPU构建配置
+  │   └── ...
+  ├── include/fbgemm_gpu/       # 公共头文件
+  │   └── npu/                  # NPU公共接口（新增）
+  └── CMakeLists.txt            # 主构建配置（最小修改）
+
+  这一节看起来如何？是否符合你的预期？
+
+❯ 没问题 
+
+● 很好，继续下一部分。
+
+  第二章：核心组件设计
+
+  2.1 统一分发器 (Dispatcher)
+
+  分发器是整个架构的核心，负责根据张量设备类型路由到对应后端实现。设计要点：
+
+  文件位置: fbgemm_gpu/src/npu/dispatch/dispatcher.h
+
+  分发器提供统一的算子入口，使用前向声明避免循环依赖。通过inline函数保证零额外开
+  销，编译器会优化掉函数调用。分发逻辑使用简单的if-else链，根据tensor.device().t
+  ype()判断：
+
+  c10::DeviceType device_type = tensor.device().type();
+  if (device_type == c10::kPrivateUse1) {  // NPU
+      return npu::op_npu(tensor);
+  } else if (device_type == c10::kCUDA) {
+      return cuda::op_cuda(tensor);
+  } else {
+      return cpu::op_cpu(tensor);
+  }
+
+  为避免代码重复，设计宏系统自动生成分发器。支持两种扩展模式：
+  - 单算子添加: 手动注册新算子的分发函数
+  - 批量注册: 使用FOR_EACH_NPU_OP宏批量生成
+
+  2.2 NPU算子实现层
+
+  每个NPU算子包含两个组件：
+
+  Wrapper层 (fbgemm_gpu/src/npu/sparse_ops/*.cpp):
+  - 提供符合FBGEMM规范的C++接口
+  - 使用AT_DISPATCH_*宏进行类型调度
+  - 处理张量连续性、设备检查等前置条件
+  - 调用AscendC算子或ACLNN API
+
+  AscendC Kernel层 (fbgemm_gpu/src/npu/ascendc/*.ascendc):
+  - 实现实际的NPU计算逻辑
+  - 独立编译为.so文件
+  - 运行时动态加载
+
+  两层通过符号绑定或ACLNN API连接，保证AscendC代码可以独立开发和优化。
+
+  这一节的组件设计是否清晰？
+
+❯ 1. ascendc的kernel实现文件不是ascendc后缀 2. 算子实现没有考虑host         
+  tiling的内容                                                              
+
+● 好的，让我修正这两个问题。先让我查看AscendC样例的实际文件结构和tiling实现。
+
+● Bash(ls -la /home/hsl/RecSDK/cust_op/ascendc_op/ai_core_op/invert_permute/
+      2>/dev/null || ls -la
+      /home/hsl/RecSDK/cust_op/ascendc_op/ai_core_op/token_mixing/ 2>/dev/…)
+  ⎿  total 12
+     drwxr-xr-x.  3 root root 4096 Jan 23 22:21 .
+     drwxr-xr-x. 35 root root 4096 Jan 23 22:21 ..
+     drwxr-xr-x.  4 root root 4096 Jan 23 22:21 c310
+
+● Read(/home/hsl/RecSDK/cust_op/ascendc_op/ai_core_op/invert_permute/c310/op_hos
+      t/invert_permute_tiling.h)
+  ⎿  Read 28 lines
+
+● Read(/home/hsl/RecSDK/cust_op/ascendc_op/ai_core_op/invert_permute/c310/op_ker
+      nel/invert_permute.cpp)
+  ⎿  Read 38 lines
+
+● 非常感谢指正！现在我理解了AscendC的实际结构。让我修正第二章：
+
+  第二章：核心组件设计（修正版）
+
+  2.1 统一分发器
+
+  分发器是整个架构的核心，负责根据张量设备类型路由到对应后端实现。设计要点：
+
+  文件位置: fbgemm_gpu/src/npu/dispatch/dispatcher.h
+
+  分发器提供统一的算子入口，使用前向声明避免循环依赖。通过inline函数保证零额外开
+  销，编译器会优化掉函数调用。分发逻辑使用简单的if-else链，根据tensor.device().t
+  ype()判断后端类型。
+
+  为避免代码重复，设计宏系统自动生成分发器。支持两种扩展模式：
+  - 单算子添加: 手动注册新算子的分发函数
+  - 批量注册: 使用FOR_EACH_NPU_OP宏批量生成
+
+  2.2 NPU算子实现层
+
+  每个NPU算子采用三层架构，完全对应AscendC的设计模式：
+
+  Layer 1: PyTorch Wrapper层 (fbgemm_gpu/src/npu/sparse_ops/*.cpp):
+  - 提供符合FBGEMM规范的C++接口
+  - 使用AT_DISPATCH_*宏进行类型调度
+  - 处理张量连续性、设备检查等前置条件
+  - 调用ACLNN API或AscendC编译生成的算子接口
+
+  Layer 2: AscendC Host层 (fbgemm_gpu/src/npu/ascendc/op_host/):
+  - .cpp: 包含Tiling函数、Shape推导、类型推导
+  - _tiling.h: Tiling数据结构定义
+  - 负责计算如何将数据分块到多个AI Core（类似CUDA的grid/block配置）
+  - 根据输入shape和数据类型设置tiling参数
+
+  Layer 3: AscendC Kernel层 (fbgemm_gpu/src/npu/ascendc/op_kernel/):
+  - .cpp: 实际的NPU计算逻辑（使用AscendC API）
+  - _kernel.h: Kernel函数声明
+  - 从tiling参数读取配置并执行SIMT并行计算
+
+  2.3 AscendC目录结构
+
+  fbgemm_gpu/src/npu/ascendc/
+  ├── op_host/
+  │   ├── invert_permute.cpp          # Host侧实现
+  │   └── invert_permute_tiling.h     # Tiling数据结构
+  ├── op_kernel/
+  │   ├── invert_permute.cpp          # Kernel侧实现
+  │   └── invert_permute_kernel.h     # Kernel声明
+  └── CMakeLists.txt                  # AscendC独立编译配置
+
+  Tiling机制的作用：
+  - 计算需要的AI Core数量（blockDim）
+  - 计算每个block的线程数（threadsPerBlock）
+  - 根据数据类型选择kernel实例（通过TilingKey）
+  - 将参数传递给Kernel执行
+
+  这一节修正后是否准确？
+
+❯ 每个算子使用单独的op_host和op_kernel目录，结构上是不是更解耦？从架构解耦  
+  、代码演进、FBGEMM仓库owner接受度上分析一下                               
+
+❯ 分析结果是什么？ 
+
+● 让我从三个维度详细分析这两种目录组织方式：
+
+  分析对比
+
+  方式1：每个算子独立目录（推荐）
+
+  ascendc/
+  ├── invert_permute/
+  │   ├── op_host/
+  │   └── op_kernel/
+  ├── permute_1d/
+  │   ├── op_host/
+  │   └── op_kernel/
+
+  方式2：共享op_host和op_kernel目录
+
+  ascendc/
+  ├── op_host/
+  │   ├── invert_permute.cpp
+  │   ├── permute_1d.cpp
+  │   └── ...
+  ├── op_kernel/
+  │   ├── invert_permute.cpp
+  │   ├── permute_1d.cpp
+  │   └── ...
+
+  ---
+  维度1：架构解耦
+  ┌────────────┬─────────────────────────┬─────────────────────────┐
+  │   评估项   │    方式1 (独立目录)     │    方式2 (共享目录)     │
+  ├────────────┼─────────────────────────┼─────────────────────────┤
+  │ 算子隔离度 │ ⭐⭐⭐⭐⭐ 完全隔离     │ ⭐⭐ 文件混在一起       │
+  ├────────────┼─────────────────────────┼─────────────────────────┤
+  │ 依赖关系   │ ⭐⭐⭐⭐⭐ 无隐藏依赖   │ ⭐⭐⭐ 容易产生隐式依赖 │
+  ├────────────┼─────────────────────────┼─────────────────────────┤
+  │ 并行开发   │ ⭐⭐⭐⭐⭐ 多人互不干扰 │ ⭐⭐ 文件冲突风险       │
+  ├────────────┼─────────────────────────┼─────────────────────────┤
+  │ 代码边界   │ ⭐⭐⭐⭐⭐ 清晰明确     │ ⭐⭐⭐ 边界模糊         │
+  └────────────┴─────────────────────────┴─────────────────────────┘
+  结论: 方式1在解耦方面明显优势
+
+  ---
+  维度2：代码演进
+  ┌────────────┬─────────────────────────────┬─────────────────────────┐
+  │   评估项   │      方式1 (独立目录)       │    方式2 (共享目录)     │
+  ├────────────┼─────────────────────────────┼─────────────────────────┤
+  │ 添加新算子 │ ⭐⭐⭐⭐⭐ 复制模板即可     │ ⭐⭐⭐ 需要理解现有结构 │
+  ├────────────┼─────────────────────────────┼─────────────────────────┤
+  │ 删除算子   │ ⭐⭐⭐⭐⭐ 删除整个目录     │ ⭐⭐ 需要删除多个文件   │
+  ├────────────┼─────────────────────────────┼─────────────────────────┤
+  │ 算子重构   │ ⭐⭐⭐⭐⭐ 不影响其他算子   │ ⭐⭐⭐ 可能影响其他算子 │
+  ├────────────┼─────────────────────────────┼─────────────────────────┤
+  │ 版本管理   │ ⭐⭐⭐⭐⭐ 每个算子独立版本 │ ⭐⭐⭐ 共享版本         │
+  ├────────────┼─────────────────────────────┼─────────────────────────┤
+  │ 代码审查   │ ⭐⭐⭐⭐⭐ 变更范围清晰     │ ⭐⭐⭐ 需要检查所有变更 │
+  └────────────┴─────────────────────────────┴─────────────────────────┘
+  具体场景：
+  - 方式1：添加new_op算子
+  cp -r invert_permute new_op
+  # 只需修改new_op/下的文件，零风险
+  - 方式2：添加new_op算子
+  # 需要在op_host/和op_kernel/下各创建新文件
+  # 可能意外修改公共头文件，影响其他算子
+
+  结论: 方式1更有利于长期演进
+
+  ---
+  维度3：FBGEMM Owner接受度
+
+  从Owner视角的考量：
+
+  方式1的优势：
+  1. ✅ 符合FBGEMM现有模式
+    - FBGEMM已经有按功能模块组织的目录（sparse_ops/, quantize_ops/等）
+    - 每个模块内部文件独立
+    - Owner熟悉这种模式
+  2. ✅ Review负担小
+    - PR只涉及特定算子目录
+    - 变更范围一目了然
+    - 不需要理解整个AscendC结构
+  3. ✅ 合并冲突少
+    - 不同算子的PR不会冲突
+    - 可以独立合并
+    - 降低合并风险
+  4. ✅ 易于回滚
+    - 单个算子有问题，直接回滚该目录
+    - 不影响其他算子
+
+  方式2的劣势：
+  1. ❌ 不符合FBGEMM模式
+    - Owner不习惯这种扁平化结构
+    - 需要学习新的组织方式
+  2. ❌ Review负担重
+    - PR可能修改op_host/或op_kernel/下多个文件
+    - 需要全面检查是否影响其他算子
+    - 不确定变更范围
+  3. ❌ 合并冲突频繁
+    - 多个算子的PR容易冲突
+    - 需要频繁解决冲突
+
+  ---
+  参考AscendC样例
+
+  查看样例实际结构：
+  /home/hsl/RecSDK/cust_op/ascendc_op/ai_core_op/
+  ├── invert_permute/
+  │   └── c310/          # 版本目录
+  │       ├── op_host/
+  │       └── op_kernel/
+  ├── token_mixing/
+  │   └── v220/          # 版本目录
+  │       ├── op_host/
+  │       └── op_kernel/
+
+  AscendC本身采用的就是每个算子独立目录的方式！
+
+  ---
+  最终结论
+
+  强烈推荐：方式1 - 每个算子使用独立的op_host和op_kernel目录
+
+  理由：
+
+  1. 架构解耦：⭐⭐⭐⭐⭐
+    - 完全隔离，符合独立团队协作需求
+  2. 代码演进：⭐⭐⭐⭐⭐
+    - 渐进式添加，风险最小
+    - 每个算子独立迭代
+  3. FBGEMM接受度：⭐⭐⭐⭐⭐
+    - 符合现有项目模式
+    - Review和合并成本最低
+    - 冲突风险最小
+  4. 额外优势：
+    - 符合AscendC样例的实践
+    - 每个算子可以独立配置CMake
+    - 便于性能分析和优化
+
+  建议的目录结构：
+
+  fbgemm_gpu/src/npu/ascendc/
+  ├── invert_permute/
+  │   ├── op_host/
+  │   │   ├── invert_permute.cpp
+  │   │   └── invert_permute_tiling.h
+  │   └── op_kernel/
+  │       ├── invert_permute.cpp
+  │       └── invert_permute_kernel.h
+  ├── permute_1d/
+  │   ├── op_host/
+  │   └── op_kernel/
+  └── CMakeLists.txt
+
+  你认同这个结论吗？
+
+❯ 可以，就这个方案 
+
+● 很好，继续完善架构设计。
+
+  第二章：核心组件设计（最终版）
+
+  2.1 统一分发器 (Dispatcher)
+
+  文件位置: fbgemm_gpu/src/npu/dispatch/dispatcher.h
+
+  分发器提供统一的算子入口，使用前向声明避免循环依赖。通过inline函数保证零额外开
+  销（~10ns）。分发逻辑根据tensor.device().type()判断：
+
+  inline Tensor invert_permute(const Tensor& permute) {
+    if (permute.device().type() == c10::kPrivateUse1) {
+      return npu::invert_permute_npu(permute);
+    } else if (permute.device().type() == c10::kCUDA) {
+      return cuda::invert_permute_cuda(permute);
+    }
+    return cpu::invert_permute_cpu(permute);
+  }
+
+  2.2 NPU算子三层架构
+
+  Layer 1: PyTorch Wrapper层 (fbgemm_gpu/src/npu/sparse_ops/*.cpp)
+  - 提供符合FBGEMM规范的C++接口
+  - 使用AT_DISPATCH_*宏进行类型调度
+  - 处理张量连续性、设备检查等前置条件
+
+  Layer 2: AscendC Host层 (每个算子独立的op_host/)
+  - .cpp: Tiling函数、Shape推导、类型推导
+  - _tiling.h: Tiling数据结构定义
+  - 计算AI Core数量、线程数、数据分块策略
+
+  Layer 3: AscendC Kernel层 (每个算子独立的op_kernel/)
+  - .cpp: NPU计算逻辑（AscendC API）
+  - _kernel.h: Kernel函数声明
+  - 从tiling参数读取配置并执行
+
+  2.3 AscendC目录结构（每个算子独立）
+
+  fbgemm_gpu/src/npu/ascendc/
+  ├── invert_permute/
+  │   ├── op_host/
+  │   │   ├── invert_permute.cpp
+  │   │   └── invert_permute_tiling.h
+  │   └── op_kernel/
+  │       ├── invert_permute.cpp
+  │       └── invert_permute_kernel.h
+  ├── permute_1d/
+  │   ├── op_host/
+  │   │   ├── permute_1d.cpp
+  │   │   └── permute_1d_tiling.h
+  │   └── op_kernel/
+  │       ├── permute_1d.cpp
+  │       └── permute_1d_kernel.h
+  ├── ...
+  └── CMakeLists.txt
+
+  优势：完全解耦、独立演进、符合AscendC实践、易于合入。
+
+  这一节现在完整了吗？
+
+❯ 可以的 
+
+● 很好，继续下一章。
+
+  第三章：编译系统设计
+
+  3.1 两阶段编译架构
+
+  采用完全独立的编译流程，AscendC算子与FBGEMM主库分开编译：
+
+  ┌─────────────────────────────────────────────────┐
+  │  阶段1: AscendC算子编译                          │
+  │  工具: AscendC Compiler (msopgen + soc)        │
+  │  输入: op_host/*.cpp + op_kernel/*.cpp          │
+  │  输出: libinvert_permute.so, libpermute_1d.so   │
+  │  触发: cmake -DUSE_NPU=ON                       │
+  └─────────────────────────────────────────────────┘
+                         ↓
+  ┌─────────────────────────────────────────────────┐
+  │  阶段2: NPU Wrapper编译                         │
+  │  工具: CMake + CANN                             │
+  │  输入: npu/sparse_ops/*.cpp + 阶段1的.so        │
+  │  输出: libfbgemm_npu.so                         │
+  │  链接: libfbgemm_gpu.so                         │
+  └─────────────────────────────────────────────────┘
+
+  3.2 CMake配置结构
+
+  主CMakeLists.txt修改 (最小侵入):
+  # fbgemm_gpu/CMakeLists.txt
+
+  # NPU支持 - 可选依赖
+  option(USE_NPU "Build with Ascend NPU support" OFF)
+
+  if(USE_NPU)
+    # 检查CANN工具链
+    find_package(CANN REQUIRED)
+
+    # 添加NPU子目录
+    add_subdirectory(src/npu)
+
+    # 链接NPU wrapper
+    target_link_libraries(fbgemm_gpu PRIVATE fbgemm_npu_wrapper)
+  endif()
+
+  NPU CMakeLists.txt:
+  # fbgemm_gpu/src/npu/CMakeLists.txt
+
+  # 编译AscendC算子
+  add_subdirectory(ascendc)
+
+  # NPU Wrapper库
+  add_library(fbgemm_npu_wrapper STATIC
+    dispatch/sparse_ops.cpp
+    sparse_ops/invert_permute.cpp
+    sparse_ops/permute_1d.cpp
+  )
+
+  target_link_libraries(fbgemm_npu_wrapper
+    PUBLIC
+      fbgemm_gpu::utils
+      torch::torch
+      ${CANN_LIBRARIES}
+      ascendc_ops  # AscendC算子集合
+  )
+
+  target_include_directories(fbgemm_npu_wrapper
+    PUBLIC
+      ${CANN_INCLUDE_DIRS}
+      ${CMAKE_CURRENT_SOURCE_DIR}
+  )
+
+  AscendC CMakeLists.txt:
+  # fbgemm_gpu/src/npu/ascendc/CMakeLists.txt
+
+  # 为每个算子创建独立库
+  foreach(op ${NPU_ASCENDC_OPS})
+    add_subdirectory(${op})
+  endforeach()
+
+  # 聚合所有AscendC算子
+  add_library(ascendc_ops INTERFACE)
+  target_link_libraries(ascendc_ops INTERFACE ${NPU_ASCENDC_LIBS})
+
+  单个算子CMakeLists.txt (invert_permute为例):
+  # fbgemm_gpu/src/npu/ascendc/invert_permute/CMakeLists.txt
+
+  # 使用AscendC工具链编译
+  set(ASCENDC_OP_NAME invert_permute)
+  set(ASCENDC_OP_DIR ${CMAKE_CURRENT_SOURCE_DIR})
+
+  # 调用AscendC编译脚本
+  execute_process(
+    COMMAND ${ASCENDC_COMPILER}
+      --op-name ${ASCENDC_OP_NAME}
+      --op-host ${ASCENDC_OP_DIR}/op_host
+      --op-kernel ${ASCENDC_OP_DIR}/op_kernel
+      --output ${CMAKE_CURRENT_BINARY_DIR}
+    RESULT_VARIABLE ASCENDC_COMPILE_RESULT
+  )
+
+  if(NOT ASCENDC_COMPILE_RESULT EQUAL 0)
+    message(FATAL_ERROR "AscendC compilation failed for ${ASCENDC_OP_NAME}")
+  endif()
+
+  # 生成的.so文件
+  add_library(ascendc_${ASCENDC_OP_NAME} SHARED
+    ${CMAKE_CURRENT_BINARY_DIR}/${ASCENDC_OP_NAME}.o
+  )
+
+  3.3 工具链检测和配置
+
+  # 检测CANN安装路径
+  if(NOT DEFINED CANN_PATH)
+    set(CANN_PATH "/usr/local/Ascend" CACHE PATH "CANN installation path")
+  endif()
+
+  # 检测AscendC编译器
+  find_program(ASCENDC_COMPILER
+    msopgen
+    PATHS ${CANN_PATH}/bin
+    NO_DEFAULT_PATH
+  )
+
+  if(NOT ASCENDC_COMPILER)
+    message(WARNING "AscendC compiler not found. NPU support will be disabled.")
+    set(USE_NPU OFF)
+  endif()
+
+  3.4 编译产物
+
+  fbgmm_gpu/build/
+  ├── lib/
+  │   ├── libfbgemm_gpu.so              # 主库（无NPU依赖）
+  │   ├── libfbgemm_npu_wrapper.so       # NPU wrapper（需USE_NPU=ON）
+  │   └── npu_ops/                       # AscendC算子库
+  │       ├── libinvert_permute.so
+  │       ├── libpermute_1d.so
+  │       └── ...
+  └── npu/
+      └── ascendc/
+          ├── invert_permute/
+          ├── permute_1d/
+          └── ...
+
+  这一节的编译系统设计是否清晰？
+
+❯ 可以 
+
+● 很好，继续下一章。
+
+  第四章：类型系统设计
+
+  4.1 FBGEMM类型系统映射
+
+  FBGEMM使用PyTorch的AT_DISPATCH_*宏进行类型调度。NPU
+  wrapper需要映射到FBGEMM的类型系统：
+
+  // fbgemm_gpu/src/npu/sparse_ops/invert_permute.cpp
+
+  Tensor invert_permute_npu(const Tensor& permute) {
+    // 使用FBGEMM的类型调度宏
+    AT_DISPATCH_INDEX_TYPES(
+        permute.scalar_type(),
+        "invert_permute_npu",
+        [&] {
+          return invert_permute_npu_impl<index_t>(permute);
+        });
+  }
+
+  template <typename index_t>
+  Tensor invert_permute_npu_impl(const Tensor& permute) {
+    // 映射到AscendC的数据类型
+    if constexpr (std::is_same_v<index_t, int32_t>) {
+      return call_ascendc_op<int32_t>(permute);
+    } else if constexpr (std::is_same_v<index_t, int64_t>) {
+      return call_ascendc_op<int64_t>(permute);
+    }
+  }
+
+  4.2 类型映射表
+  FBGEMM/C++类型: int32_t
+  PyTorch ScalarType: kInt
+  AscendC类型: ge::DT_INT32
+  ACLNN API: aclnnInvertPermuteInt32
+  ────────────────────────────────────────
+  FBGEMM/C++类型: int64_t
+  PyTorch ScalarType: kLong
+  AscendC类型: ge::DT_INT64
+  ACLNN API: aclnnInvertPermuteInt64
+  ────────────────────────────────────────
+  FBGEMM/C++类型: float
+  PyTorch ScalarType: kFloat
+  AscendC类型: ge::DT_FLOAT
+  ACLNN API: aclnnXxxFloat
+  ────────────────────────────────────────
+  FBGEMM/C++类型: float16
+  PyTorch ScalarType: kHalf
+  AscendC类型: ge::DT_FLOAT16
+  ACLNN API: aclnnXxxFloat16
+  ────────────────────────────────────────
+  FBGEMM/C++类型: bfloat16
+  PyTorch ScalarType: kBFloat16
+  AscendC类型: ge::DT_BF16
+  ACLNN API: aclnnXxxBf16
+  4.3 NPU类型工具函数
+
+  // fbgemm_gpu/src/npu/utils/npu_type_utils.h
+
+  namespace fbgemm_gpu::npu {
+
+  // 类型映射：c10::ScalarType -> AscendC ge::DataType
+  inline ge::DataType get_ge_dtype(c10::ScalarType type) {
+    switch(type) {
+      case c10::kInt: return ge::DT_INT32;
+      case c10::kLong: return ge::DT_INT64;
+      case c10::kFloat: return ge::DT_FLOAT;
+      case c10::kHalf: return ge::DT_FLOAT16;
+      case c10::kBFloat16: return ge::DT_BF16;
+      default: TORCH_CHECK(false, "Unsupported dtype for NPU");
+    }
+  }
+
+  // 设备检查
+  inline bool is_npu_tensor(const Tensor& tensor) {
+    return tensor.device().type() == c10::kPrivateUse1;
+  }
+
+  // NPU设备保护（类似CUDA_DEVICE_GUARD）
+  class NPUDeviceGuard {
+    c10::Device prev_device;
+  public:
+    explicit NPUDeviceGuard(const Tensor& tensor) {
+      prev_device = c10::current_device();
+      c10::set_device(tensor.device());
+    }
+    ~NPUDeviceGuard() {
+      c10::set_device(prev_device);
+    }
+  };
+
+  } // namespace fbgemm_gpu::npu
+
+  4.4 类型调度宏扩展
+
+  复用FBGEMM现有的DISPATCH宏系统，最小化学习成本：
+
+  // 扩展现有的DISPATCH宏以支持NPU类型检查
+  #ifdef USE_NPU
+  #define TENSOR_ON_NPU_GPU(tensor)                                    \
+    TORCH_CHECK(                                                      \
+        fbgemm_gpu::npu::is_npu_tensor(tensor),                       \
+        "Tensor must be on NPU device but is on device: ",           \
+        tensor.device());
+  #else
+  #define TENSOR_ON_NPU_GPU(tensor)                                    \
+    TORCH_CHECK(false, "NPU support not compiled in");
+  #endif
+
+  这一节的类型系统设计是否清晰？
+
+❯ 可以 
+
+● 很好，继续下一章。
+
+  第五章：算子注册和分发机制
+
+  5.1 分发器注册流程
+
+  ┌─────────────────────────────────────────────────┐
+  │  1. 前向声明各后端实现                          │
+  │     namespace cuda { Tensor op_cuda(...); }     │
+  │     namespace npu { Tensor op_npu(...); }       │
+  │     namespace cpu { Tensor op_cpu(...); }       │
+  └─────────────────────────────────────────────────┘
+                         ↓
+  ┌─────────────────────────────────────────────────┐
+  │  2. 定义分发函数                                │
+  │     inline Tensor op(const Tensor& x) {         │
+  │       if (x.is_npu()) return npu::op_npu(x);    │
+  │       else if (x.is_cuda()) return cuda::op(x); │
+  │       else return cpu::op_cpu(x);               │
+  │     }                                           │
+  └─────────────────────────────────────────────────┘
+                         ↓
+  ┌─────────────────────────────────────────────────┐
+  │  3. 注册到PyTorch                               │
+  │     TORCH_LIBRARY_IMPL(fbgemm, CatchAll, m) {   │
+  │       m.impl("op_name", &dispatch::op);         │
+  │     }                                           │
+  └─────────────────────────────────────────────────┘
+
+  5.2 分发器代码结构
+
+  文件: fbgemm_gpu/src/npu/dispatch/dispatcher.h
+  #pragma once
+
+  #include <ATen/Tensor.h>
+  #include <torch/library.h>
+
+  namespace fbgemm_gpu::dispatch {
+
+  // 前向声明CUDA实现
+  namespace cuda {
+  Tensor invert_permute_cuda(const Tensor& permute);
+  Tensor permute_1d_cuda(const Tensor& input, const Tensor& indices);
+  // ... 其他CUDA算子
+  } // namespace cuda
+
+  // 前向声明CPU实现
+  namespace cpu {
+  Tensor invert_permute_cpu(const Tensor& permute);
+  Tensor permute_1d_cpu(const Tensor& input, const Tensor& indices);
+  // ... 其他CPU算子
+  } // namespace cpu
+
+  // NPU实现声明和定义
+  #ifdef USE_NPU
+  namespace npu {
+  Tensor invert_permute_npu(const Tensor& permute);
+  Tensor permute_1d_npu(const Tensor& input, const Tensor& indices);
+  // ... 其他NPU算子
+  } // namespace npu
+  #endif
+
+  // 统一分发函数
+  inline Tensor invert_permute(const Tensor& permute) {
+    auto device_type = permute.device().type();
+
+    if (device_type == c10::kPrivateUse1) {
+  #ifdef USE_NPU
+      return npu::invert_permute_npu(permute);
+  #else
+      TORCH_CHECK(false, "NPU support not compiled in. Please rebuild with 
+  -DUSE_NPU=ON");
+  #endif
+    } else if (device_type == c10::kCUDA) {
+      return cuda::invert_permute_cuda(permute);
+    } else {
+      return cpu::invert_permute_cpu(permute);
+    }
+  }
+
+  inline Tensor permute_1d(const Tensor& input, const Tensor& indices) {
+    auto device_type = input.device().type();
+
+    if (device_type == c10::kPrivateUse1) {
+  #ifdef USE_NPU
+      return npu::permute_1d_npu(input, indices);
+  #else
+      TORCH_CHECK(false, "NPU support not compiled in");
+  #endif
+    } else if (device_type == c10::kCUDA) {
+      return cuda::permute_1d_cuda(input, indices);
+    } else {
+      return cpu::permute_1d_cpu(input, indices);
+    }
+  }
+
+  } // namespace fbgemm_gpu::dispatch
+
+  5.3 PyTorch注册
+
+  文件: fbgemm_gpu/src/npu/dispatch/sparse_ops.cpp
+  #include "fbgemm_gpu/src/npu/dispatch/dispatcher.h"
+  #include <torch/library.h>
+
+  // 注册所有分发函数到fbgemm命名空间
+  // 使用CatchAll作为分发键，让分发器自己决定路由逻辑
+  TORCH_LIBRARY_IMPL(fbgemm, CatchAll, m) {
+    // 稀疏算子
+    m.impl("invert_permute", &fbgemm_gpu::dispatch::invert_permute);
+    m.impl("permute_1d", &fbgemm_gpu::dispatch::permute_1d);
+    m.impl("permute_2d", &fbgemm_gpu::dispatch::permute_2d);
+
+    // 扩展其他算子时在这里添加
+    // m.impl("new_op", &fbgemm_gpu::dispatch::new_op);
+  }
+
+  5.4 批量注册宏系统
+
+  为减少重复代码，提供宏系统自动生成分发器：
+
+  文件: fbgemm_gpu/src/npu/dispatch/registry.h
+  #pragma once
+
+  #define NPU_UNARY_OP(name) \
+    inline Tensor name(const Tensor& x) { \
+      return dispatch_unary_op(#name, x); \
+    }
+
+  #define NPU_BINARY_OP(name) \
+    inline Tensor name(const Tensor& x, const Tensor& y) { \
+      return dispatch_binary_op(#name, x, y); \
+    }
+
+  // 支持的算子列表
+  #define FOR_EACH_NPU_SPARSE_OP(_) \
+    _(invert_permute) \
+    _(permute_1d) \
+    _(permute_2d) \
+    _(index_select_dim0)
+
+  #define FOR_EACH_NPU_QUANTIZE_OP(_) \
+    _(quantize) \
+    _(dequantize) \
+    _(int_nbit_split_embedding_codegen_lookup_function)
+
+  // 自动生成算子分发声明
+  FOR_EACH_NPU_SPARSE_OP(NPU_UNARY_OP)
+  FOR_EACH_NPU_QUANTIZE_OP(NPU_UNARY_OP)
+
+  5.5 与现有CUDA注册的关系
+
+  现有CUDA算子保持不变：
+  // fbgemm_gpu/src/sparse_ops/sparse_invert_permute.cu
+  FBGEMM_OP_DISPATCH(CUDA, "invert_permute", fbgemm_gpu::invert_permute_cuda);
+
+  通过CatchAll分发器覆盖，实现路由：
+  - CatchAll的优先级低于具体的设备类型（CUDA/CPU）
+  - 但分发器内部会判断设备类型并调用对应实现
+  - 保持CUDA代码完全不变
+
+  这一节的算子注册和分发机制是否清晰？
+
+❯ CUDA有对应的批量注册宏系统吗，为什么NPU需要 
+
+● 好问题！让我检查一下FBGEMM现有的CUDA注册方式。
+
+● Search(pattern: "FOR_EACH_|DISPATCH_TO_CUDA", head_limit: 10)
+  ⎿  Found 10 files (ctrl+o to expand)
+
+● Search(pattern: "TORCH_LIBRARY_IMPL\(fbgemm, CUDA", output_mode: "content",
+        head_limit: 5)
+  ⎿  Found 5 lines (ctrl+o to expand)
+
+● 非常好的观察！你发现了设计中的不一致性。让我修正：
+
+● Search(pattern: "define DISPATCH_TO_CUDA", output_mode: "content", head_limit:
+         3)
+  ⎿  Found 3 lines (ctrl+o to expand)
+
+● 你说得对！我发现了一个设计问题。让我修正第五章：
+
+  第五章：算子注册和分发机制（修正版）
+
+  5.1 CUDA现有注册方式
+
+  FBGEMM的CUDA算子使用简单的DISPATCH_TO_CUDA宏逐个注册：
+
+  // fbgemm_gpu/src/sparse_ops/sparse_ops_gpu.cpp
+  TORCH_LIBRARY_IMPL(fbgemm, CUDA, m) {
+    DISPATCH_TO_CUDA("invert_permute", fbgemm_gpu::invert_permute_cuda);
+    DISPATCH_TO_CUDA("permute_1d", fbgemm_gpu::permute_1d_cuda);
+    // ... 逐个注册
+  }
+
+  DISPATCH_TO_CUDA宏定义：
+  #define DISPATCH_TO_CUDA(name, function) \
+    m.impl(name, torch::dispatch(c10::DispatchKey::CUDA, TORCH_FN(function)))
+
+  特点：
+  - ✅ 简单直接
+  - ✅ 每个算子独立注册
+  - ✅ 没有批量宏系统
+
+  5.2 NPU分发器注册（与CUDA保持一致）
+
+  NPU应该使用与CUDA完全一致的注册风格：
+
+  // fbgemm_gpu/src/npu/dispatch/sparse_ops.cpp
+  #include "fbgemm_gpu/src/npu/dispatch/dispatcher.h"
+  #include <torch/library.h>
+
+  // 使用CatchAll分发键注册分发器
+  // 分发器内部会根据设备类型路由到对应后端
+  TORCH_LIBRARY_IMPL(fbgemm, CatchAll, m) {
+    m.impl("invert_permute", &fbgemm_gpu::dispatch::invert_permute);
+    m.impl("permute_1d", &fbgemm_gpu::dispatch::permute_1d);
+    m.impl("permute_2d", &fbgemm_gpu::dispatch::permute_2d);
+    m.impl("index_select_dim0", &fbgemm_gpu::dispatch::index_select_dim0);
+    // ... 逐个注册，与CUDA风格一致
+  }
+
+  5.3 为什么不需要批量注册宏
+
+  理由：
+  1. 保持一致性：CUDA没有批量宏，NPU也不应该引入
+  2. 简单优先：YAGNI原则，目前不需要那么复杂的抽象
+  3. 减少学习成本：昇腾团队只需理解现有的CUDA注册模式
+  4. 灵活性：逐个注册更灵活，特殊算子可以单独处理
+
+  如果将来需要批量注册，可以在不破坏现有代码的前提下渐进式添加：
+  // 可选的批量宏（未来需要时再添加）
+  #define REGISTER_NPU_SPARSE_OPS(m) \
+    m.impl("invert_permute", &dispatch::invert_permute); \
+    m.impl("permute_1d", &dispatch::permute_1d); \
+    m.impl("permute_2d", &dispatch::permute_2d);
+
+  TORCH_LIBRARY_IMPL(fbgemm, CatchAll, m) {
+    REGISTER_NPU_SPARSE_OPS(m)
+  }
+
+  但目前不建议引入，保持最简单的逐个注册方式。
+
+  5.4 注册优先级说明
+
+  PyTorch的调度优先级：
+  1. 具体设备类型 (CUDA/CPU)  ← 优先级高
+  2. CatchAll                   ← 优先级低，但可以覆盖所有情况
+
+  通过CatchAll注册分发器后：
+  - CUDA张量：分发器检测到device.type() == CUDA，调用cuda::op_cuda()
+  - NPU张量：分发器检测到device.type() == PrivateUse1，调用npu::op_npu()
+  - CPU张量：分发器检测到device.type() == CPU，调用cpu::op_cpu()
+
+  这样无需修改CUDA现有注册代码，完全解耦。
+
+  这一节修正后是否合理？
+
+❯ 可以了 
+
+● 很好，继续下一章。
+
+  第六章：错误处理和日志
+
+  6.1 错误处理策略
+
+  NPU算子的错误处理需要与FBGEMM现有风格保持一致：
+
+  FBGEMM现有风格：
+  // CUDA算子的错误处理
+  Tensor invert_permute_cuda(const Tensor& permute) {
+    TENSOR_ON_CUDA_GPU(permute);  // 设备检查
+    CUDA_DEVICE_GUARD(permute);    // 设备保护
+
+    TORCH_CHECK_VALUE(
+        permute.dim() == 1,
+        "invert_permute expects 1D tensor, got ",
+        permute.dim());
+  }
+
+  NPU采用相同风格：
+  // fbgemm_gpu/src/npu/sparse_ops/invert_permute.cpp
+
+  Tensor invert_permute_npu(const Tensor& permute) {
+  #ifdef USE_NPU
+    // 设备检查
+    TENSOR_ON_NPU_GPU(permute);
+
+    // 设备保护
+    NPUDeviceGuard guard(permute);
+
+    // 参数验证
+    TORCH_CHECK_VALUE(
+        permute.dim() == 1,
+        "invert_permute expects 1D tensor, got ",
+        permute.dim());
+
+    TORCH_CHECK_VALUE(
+        permute.numel() > 0 && permute.numel() <= (1L << 31),
+        "invert_permute: tensor size must be in [1, 2^31], got ",
+        permute.numel());
+
+    // 调用AscendC算子
+    Tensor output = at::empty_like(permute);
+    EXEC_NPU_CMD(aclnnInvertPermute, permute, output);
+
+    return output;
+  #else
+    TORCH_CHECK(false, "NPU support not compiled in");
+  #endif
+  }
+
+  6.2 NPU专用宏定义
+
+  // fbgemm_gpu/src/npu/utils/npu_ops_utils.h
+
+  #pragma once
+
+  #include <ATen/Tensor.h>
+  #include <c10/core/DeviceType.h>
+  #include <torch/library.h>
+
+  #ifdef USE_NPU
+
+  namespace fbgemm_gpu::npu {
+
+  // 设备检查宏（类似TENSOR_ON_CUDA_GPU）
+  #define TENSOR_ON_NPU_GPU(tensor)                                    \
+    TORCH_CHECK(                                                      \
+        (tensor).device().type() == c10::kPrivateUse1,                \
+        "Tensor must be on NPU device but is on device: ",           \
+        (tensor).device());
+
+  // NPU设备保护类
+  class NPUDeviceGuard {
+    c10::Device prev_device_;
+  public:
+    explicit NPUDeviceGuard(const at::Tensor& tensor) 
+      : prev_device_(c10::current_device()) {
+      c10::set_device(tensor.device());
+    }
+
+    ~NPUDeviceGuard() {
+      c10::set_device(prev_device_);
+    }
+
+    // 禁止拷贝
+    NPUDeviceGuard(const NPUDeviceGuard&) = delete;
+    NPUDeviceGuard& operator=(const NPUDeviceGuard&) = delete;
+  };
+
+  // ACLNN错误检查宏
+  #define CHECK_NPU_CMD(cmd)                                          \
+    do {                                                              \
+      auto ret = (cmd);                                               \
+      if (ret != 0) {                                                 \
+        TORCH_CHECK(false, "NPU command failed: " #cmd ", ret=", ret); \
+      }                                                               \
+    } while(0)
+
+  } // namespace fbgemm_gpu::npu
+
+  #endif // USE_NPU
+
+  6.3 日志系统
+
+  复用FBGEMM现有的日志系统（如果有），或使用PyTorch标准日志：
+
+  // 使用PyTorch的logging系统
+  #include <ATen/Logging.h>
+
+  Tensor invert_permute_npu(const Tensor& permute) {
+  #ifdef USE_NPU
+    // 调试日志
+    VLOG(1) << "invert_permute_npu called with tensor shape: "
+            << permute.sizes();
+
+    // 性能日志
+    at::record_function_start("invert_permute_npu");
+
+    // 执行算子
+    Tensor output = ...;
+
+    at::record_function_end("invert_permute_npu");
+
+    return output;
+  #else
+    TORCH_CHECK(false, "NPU support not compiled in");
+  #endif
+  }
+
+  6.4 错误信息一致性
+
+  所有错误信息需要遵循FBGEMM的命名和格式规范：
+
+  // 好的错误信息
+  TORCH_CHECK(
+      permute.is_contiguous(),
+      "invert_permute_npu: input tensor must be contiguous, got stride=",
+      permute.strides());
+
+  // 避免的错误信息（太简单）
+  TORCH_CHECK(permute.is_contiguous(), "tensor not contiguous");
+
+  // 避免的错误信息（太复杂）
+  TORCH_CHECK(
+      permute.is_contiguous(),
+      "The input tensor provided to the invert_permute operation on the NPU "
+      "device must be contiguous in memory layout, meaning that the tensor's "
+      "strides must correspond to a row-major order without any gaps or "
+      "overlaps in the underlying storage. The provided tensor has strides ",
+      permute.strides());
+
+  6.5 边界条件处理
+
+  参考AscendC样例的约束：
+
+  Tensor invert_permute_npu(const Tensor& permute) {
+    // 类型检查
+    TORCH_CHECK(
+        permute.scalar_type() == at::kInt ||
+        permute.scalar_type() == at::kLong,
+        "invert_permute_npu only supports int32 and int64, got ",
+        permute.scalar_type());
+
+    // 维度检查
+    TORCH_CHECK(
+        permute.dim() == 1,
+        "invert_permute_npu expects 1D tensor, got dim=",
+        permute.dim(),
+        ", shape=",
+        permute.sizes());
+
+    // 长度检查（参考AscendC约束）
+    int64_t length = permute.numel();
+    TORCH_CHECK(
+        length >= 1 && length <= (1L << 31),
+        "invert_permute_npu: tensor length must be in [1, 2^31], got ",
+        length);
+
+    // 空张量特殊处理
+    if (length == 0) {
+      return at::empty_like(permute);
+    }
+
+    // ... 正常逻辑
+  }
+
+  这一节的错误处理和日志设计是否合理？
+
+❯ TENSOR_ON_NPU_GPU这个命名有点奇怪，直接TENSOR_ON_NPU宏就可以了吧 
+
+● 你说得对！TENSOR_ON_NPU_GPU命名确实不合适，GPU和NPU是不同的硬件。让我修正：
+
+  6.2 NPU专用宏定义（修正版）
+
+  // fbgemm_gpu/src/npu/utils/npu_ops_utils.h
+
+  #pragma once
+
+  #include <ATen/Tensor.h>
+  #include <c10/core/DeviceType.h>
+  #include <torch/library.h>
+
+  #ifdef USE_NPU
+
+  namespace fbgemm_gpu::npu {
+
+  // 设备检查宏
+  #define TENSOR_ON_NPU(tensor)                                         \
+    TORCH_CHECK(                                                       \
+        (tensor).device().type() == c10::kPrivateUse1,                 \
+        "Tensor must be on NPU device but is on device: ",            \
+        (tensor).device());
+
+  // NPU设备保护类
+  class NPUDeviceGuard {
+    c10::Device prev_device_;
+  public:
+    explicit NPUDeviceGuard(const at::Tensor& tensor) 
+      : prev_device_(c10::current_device()) {
+      c10::set_device(tensor.device());
+    }
+
+    ~NPUDeviceGuard() {
+      c10::set_device(prev_device_);
+    }
+
+    NPUDeviceGuard(const NPUDeviceGuard&) = delete;
+    NPUDeviceGuard& operator=(const NPUDeviceGuard&) = delete;
+  };
+
+  // ACLNN错误检查宏
+  #define CHECK_NPU_CMD(cmd)                                          \
+    do {                                                              \
+      auto ret = (cmd);                                               \
+      if (ret != 0) {                                                 \
+        TORCH_CHECK(false, "NPU command failed: " #cmd ", ret=", ret); \
+      }                                                               \
+    } while(0)
+
+  } // namespace fbgemm_gpu::npu
+
+  #endif // USE_NPU
+
+  使用示例：
+  Tensor invert_permute_npu(const Tensor& permute) {
+    TENSOR_ON_NPU(permute);  // 简洁清晰
+    NPUDeviceGuard guard(permute);
+    // ...
+  }
+
+  感谢指出！命名更简洁了。这一节现在可以了吗？
+
+❯ 可以了 
+
+● 很好，继续下一章。
+
+  第七章：测试策略
+
+  7.1 测试层次结构
+
+  ┌─────────────────────────────────────────────────┐
+  │  1. 单元测试            │
+  │     - 测试单个NPU算子正确性                       │
+  │     - 验证与CUDA结果数值一致                      │
+  └─────────────────────────────────────────────────┘
+                         ↓
+  ┌─────────────────────────────────────────────────┐
+  │  2. 集成测试                 │
+  │     - 测试分发器路由逻辑                          │
+  │     - 验证多设备混合场景                          │
+  └─────────────────────────────────────────────────┘
+                         ↓
+  ┌─────────────────────────────────────────────────┐
+  │  3. 性能测试                  │
+  │     - 对比NPU vs CUDA性能                         │
+  │     - 验证Tiling参数优化效果                       │
+  └─────────────────────────────────────────────────┘
+                         ↓
+  ┌─────────────────────────────────────────────────┐
+  │  4. 端到端测试                  │
+  │     - 在推荐模型中验证                            │
+  │     - 验证训练收敛性                              │
+  └─────────────────────────────────────────────────┘
+
+  7.2 单元测试
+
+  测试目录结构：
+  fbgemm_gpu/test/npu/
+  ├── sparse_ops/
+  │   ├── test_invert_permute.py
+  │   ├── test_permute_1d.py
+  │   └── test_permute_2d.py
+  ├── quantize_ops/
+  │   ├── test_quantize.py
+  │   └── test_dequantize.py
+  └── utils/
+      ├── test_dtype_utils.py
+      └── test_device_utils.py
+
+  测试示例：
+  # test_invert_permute.py
+
+  import pytest
+  import torch
+  import torch_npu
+  import fbgemm_gpu
+
+  class TestInvertPermuteNPU:
+      """测试invert_permute算子"""
+
+      @pytest.mark.skipif(not torch.npu.is_available(), reason="NPU not 
+  available")
+      def test_invert_permute_int32(self):
+          """测试int32类型"""
+          x = torch.tensor([1, 2, 0, 3], dtype=torch.int32)
+          x_npu = x.npu()
+
+          # NPU计算
+          y_npu = torch.ops.fbgemm.invert_permute(x_npu)
+
+          # CUDA计算（参考）
+          x_cuda = x.cuda()
+          y_cuda = torch.ops.fbgemm.invert_permute(x_cuda)
+
+          # 验证结果一致
+          assert torch.equal(y_npu.cpu(), y_cuda.cpu())
+
+      @pytest.mark.skipif(not torch.npu.is_available(), reason="NPU not 
+  available")
+      def test_invert_permute_int64(self):
+          """测试int64类型"""
+          x = torch.tensor([1, 2, 0, 3], dtype=torch.int64)
+          x_npu = x.npu()
+
+          y_npu = torch.ops.fbgemm.invert_permute(x_npu)
+          y_cuda = torch.ops.fbgemm.invert_permute(x.cuda())
+
+          assert torch.equal(y_npu.cpu(), y_cuda.cpu())
+
+      @pytest.mark.skipif(not torch.npu.is_available(), reason="NPU not 
+  available")
+      def test_invert_permute_large_tensor(self):
+          """测试大张量"""
+          x = torch.arange(10000).to(torch.int32)
+          x_npu = x.npu()
+
+          y_npu = torch.ops.fbgemm.invert_permute(x_npu)
+          y_cuda = torch.ops.fbgemm.invert_permute(x.cuda())
+
+          assert torch.equal(y_npu.cpu(), y_cuda.cpu())
+
+      @pytest.mark.skipif(not torch.npu.is_available(), reason="NPU not 
+  available")
+      def test_invert_permute_empty_tensor(self):
+          """测试空张量边界条件"""
+          x = torch.tensor([], dtype=torch.int32)
+          x_npu = x.npu()
+
+          y_npu = torch.ops.fbgemm.invert_permute(x_npu)
+          y_cuda = torch.ops.fbgemm.invert_permute(x.cuda())
+
+          assert torch.equal(y_npu.cpu(), y_cuda.cpu())
+
+  7.3 集成测试
+
+  分发器路由测试：
+  # test_dispatcher.py
+
+  import pytest
+  import torch
+  import torch_npu
+
+  @pytest.mark.skipif(not torch.npu.is_available(), reason="NPU not available")
+  def test_auto_dispatch():
+      """测试自动设备路由"""
+      x = torch.tensor([1, 2, 0])
+
+      # CPU张量 → CPU实现
+      y_cpu = torch.ops.fbgemm.invert_permute(x)
+      assert y_cpu.device.type == 'cpu'
+
+      # CUDA张量 → CUDA实现
+      if torch.cuda.is_available():
+          x_cuda = x.cuda()
+          y_cuda = torch.ops.fbgemm.invert_permute(x_cuda)
+          assert y_cuda.device.type == 'cuda'
+
+      # NPU张量 → NPU实现
+      x_npu = x.npu()
+      y_npu = torch.ops.fbgemm.invert_permute(x_npu)
+      assert y_npu.device.type == 'privateuseone'
+
+      # 验证结果一致
+      assert torch.equal(y_cpu, y_npu.cpu())
+
+  7.4 性能测试
+
+  # test_performance.py
+
+  import time
+  import torch
+  import torch_npu
+
+  def benchmark_invert_permute(device, size, iterations=100):
+      """性能测试"""
+      x = torch.randn(size).to(torch.int32).to(device)
+
+      # 预热
+      for _ in range(10):
+          _ = torch.ops.fbgemm.invert_permute(x)
+
+      torch.npu.synchronize() if device.type == 'privateuseone' else
+  torch.cuda.synchronize()
+
+      # 计时
+      start = time.time()
+      for _ in range(iterations):
+          _ = torch.ops.fbgemm.invert_permute(x)
+
+      torch.npu.synchronize() if device.type == 'privateuseone' else
+  torch.cuda.synchronize()
+      elapsed = time.time() - start
+
+      return elapsed / iterations
+
+  if torch.npu.is_available() and torch.cuda.is_available():
+      sizes = [1000, 10000, 100000, 1000000]
+
+      print("Size\tNPU(ms)\tCUDA(ms)\tSpeedup")
+      for size in sizes:
+          npu_time = benchmark_invert_permute(torch.device('npu:0'), size)
+          cuda_time = benchmark_invert_permute(torch.device('cuda:0'), size)
+          speedup = cuda_time / npu_time
+
+  print(f"{size}\t{npu_time*1000:.2f}\t{cuda_time*1000:.2f}\t{speedup:.2f}x")
+
+  7.5 CI/CD集成
+
+  CI配置：
+  # .github/workflows/npu_test.yml
+
+  name: NPU Tests
+
+  on:
+    push:
+      paths:
+        - 'fbgemm_gpu/src/npu/**'
+    pull_request:
+      paths:
+        - 'fbgemm_gpu/src/npu/**'
+
+  jobs:
+    npu-tests:
+      runs-on: [self-hosted, npu]  # 需要NPU环境
+      steps:
+        - uses: actions/checkout@v3
+
+        - name: Build with NPU
+          run: |
+            cmake -B build -DUSE_NPU=ON -DCANN_PATH=/usr/local/Ascend
+            cmake --build build --target fbgemm_gpu
+
+        - name: Run NPU unit tests
+          run: |
+            python -m pytest test/npu/ -v
+
+        - name: Run integration tests
+          run: |
+            python -m pytest test/npu/integration/ -v
+
+  7.6 测试覆盖率要求
+  ┌──────────┬────────────┬──────────────────────────────────────────┐
+  │ 测试类型 │ 覆盖率要求 │                   说明                   │
+  ├──────────┼────────────┼──────────────────────────────────────────┤
+  │ 单元测试 │ 100%       │ 每个NPU算子必须有测试                    │
+  ├──────────┼────────────┼──────────────────────────────────────────┤
+  │ 类型覆盖 │ 4种类型    │ int32, int64, float, half                │
+  ├──────────┼────────────┼──────────────────────────────────────────┤
+  │ 边界条件 │ 5+场景     │ 空张量、单元素、大张量、非连续、错误输入 │
+  ├──────────┼────────────┼──────────────────────────────────────────┤
+  │ 设备路由 │ 3种设备    │ CPU, CUDA, NPU                           │
+  ├──────────┼────────────┼──────────────────────────────────────────┤
+  │ 性能对比 │ 5个规模    │ 不同规模张量的性能对比                   │
+  └──────────┴────────────┴──────────────────────────────────────────┘
+  这一节的测试策略是否合理？
+
+❯ 测试目录结构和测试策略是否和原有的FBGEMM项目一致，确认一下 
+
+● 好问题！让我检查一下FBGEMM现有的测试结构。
+
+● Bash(find /home/hsl/FBGEMM/test -name "*.py" | head -20)
+  ⎿  (No content)
+
+● Bash(find /home/hsl/FBGEMM -name "test_*.py" -o -name "*_test.py" | head -20)
+  ⎿  /home/hsl/FBGEMM/fbgemm_gpu/test/batched_unary_embeddings_test.py
+     /home/hsl/FBGEMM/fbgemm_gpu/test/utils/filestore_test.py
+     /home/hsl/FBGEMM/fbgemm_gpu/test/test_utils.py
+     … +23 lines (ctrl+o to expand)
+
+● Read(fbgemm_gpu/test/permute/permute_pooled_embedding_test.py)
+  ⎿  Read 60 lines
+
+● Read(fbgemm_gpu/test/test_utils.py)
+  ⎿  Read 100 lines
+
+● 非常好的观察！让我修正第七章以符合FBGEMM现有的测试风格：
+
+  第七章：测试策略（修正版）
+
+  7.1 测试目录结构
+
+  符合FBGEMM现有结构：
+  fbgemm_gpu/test/
+  ├── npu/                           # NPU专用测试目录（新增）
+  │   ├── sparse_ops_test.py         # 稀疏算子测试
+  │   ├── quantize_ops_test.py       # 量化算子测试
+  │   └── dispatch_test.py           # 分发器路由测试
+  ├── combine/                       # 现有测试目录
+  ├── permute/                       # 现有测试目录
+  └── test_utils.py                  # 扩展公共工具
+
+  7.2 使用unittest + Hypothesis框架
+
+  FBGEMM现有风格：
+  # fbgemm_gpu/test/npu/sparse_ops_test.py
+
+  # Copyright (c) Meta Platforms, Inc. and affiliates.
+  # All rights reserved.
+
+  import unittest
+  import hypothesis.strategies as st
+  import torch
+  from hypothesis import given, settings, Verbosity
+
+  try:
+      from fbgemm_gpu import open_source
+      from test_utils import gpu_unavailable
+  except Exception:
+      from fbgemm_gpu.test.test_utils import gpu_unavailable
+
+  # NPU不可用时的跳过装饰器
+  npu_unavailable = (
+      not hasattr(torch, 'npu') or not torch.npu.is_available(),
+      "NPU is not available"
+  )
+
+  class NPUInvertPermuteTest(unittest.TestCase):
+      """invert_permute算子的NPU测试"""
+
+      @unittest.skipIf(*npu_unavailable)
+      @given(
+          size=st.integers(min_value=1, max_value=10000),
+          dtype=st.sampled_from([torch.int32, torch.int64]),
+      )
+      @settings(verbosity=Verbosity.verbose, max_examples=20, deadline=None)
+      def test_invert_permute_correctness(self, size: int, dtype: torch.dtype) 
+  -> None:
+          """测试NPU与CUDA结果一致性"""
+          import torch_npu
+
+          # 生成输入
+          x = torch.randperm(size).to(dtype)
+
+          # CUDA计算（参考）
+          x_cuda = x.cuda()
+          y_cuda = torch.ops.fbgemm.invert_permute(x_cuda)
+
+          # NPU计算
+          x_npu = x.npu()
+          y_npu = torch.ops.fbgemm.invert_permute(x_npu)
+
+          # 验证结果一致
+          torch.testing.assert_close(
+              y_npu.cpu(),
+              y_cuda.cpu(),
+              rtol=1e-5,
+              atol=1e-5
+          )
+
+      @unittest.skipIf(*npu_unavailable)
+      def test_invert_permute_empty_tensor(self) -> None:
+          """测试空张量边界条件"""
+          x = torch.tensor([], dtype=torch.int32)
+          x_npu = x.npu()
+
+          y_npu = torch.ops.fbgemm.invert_permute(x_npu)
+          y_cuda = torch.ops.fbgemm.invert_permute(x.cuda())
+
+          torch.testing.assert_close(y_npu.cpu(), y_cuda.cpu())
+
+  7.3 扩展test_utils.py
+
+  在现有test_utils.py中添加NPU支持：
+  # fbgemm_gpu/test/test_utils.py (新增)
+
+  # NPU设备检测（与gpu_unavailable风格一致）
+  npu_unavailable: tuple[bool, str] = (
+      not hasattr(torch, 'npu') or not torch.npu.is_available(),
+      "NPU is not available"
+  )
+
+  npu_available: bool = not npu_unavailable[0]
+
+  # 多设备测试辅助函数
+  def cpu_and_maybe_gpu_npu(test_func):
+      """
+      装饰器：在CPU、CUDA（可用）、NPU（可用）上运行测试
+      与cpu_and_maybe_gpu风格一致
+      """
+      @wraps(test_func)
+      def wrapper(self, *args, **kwargs):
+          # CPU测试
+          test_func(self, *args, device=torch.device('cpu'), **kwargs)
+
+          # CUDA测试（如果可用）
+          if torch.cuda.is_available():
+              test_func(self, *args, device=torch.device('cuda:0'), **kwargs)
+
+          # NPU测试（如果可用）
+          if npu_available:
+              test_func(self, *args, device=torch.device('npu:0'), **kwargs)
+
+      return wrapper
+
+  7.4 分发器集成测试
+
+  # fbgemm_gpu/test/npu/dispatch_test.py
+
+  import unittest
+  from test_utils import npu_unavailable
+
+  class DispatcherTest(unittest.TestCase):
+      """测试自动设备路由"""
+
+      @unittest.skipIf(*npu_unavailable)
+      def test_auto_routing_npu(self) -> None:
+          """测试NPU张量自动路由到NPU实现"""
+          x = torch.tensor([1, 2, 0])
+          x_npu = x.npu()
+
+          # 应该调用NPU实现
+          y_npu = torch.ops.fbgemm.invert_permute(x_npu)
+
+          # 验证在NPU设备上
+          self.assertEqual(y_npu.device.type, 'privateuseone')
+
+      @unittest.skipIf(*npu_unavailable)
+      def test_mixed_devices(self) -> None:
+          """测试多设备混合场景"""
+          x = torch.tensor([1, 2, 0])
+
+          # CPU
+          y_cpu = torch.ops.fbgemm.invert_permute(x)
+          self.assertEqual(y_cpu.device.type, 'cpu')
+
+          # NPU
+          if torch.npu.is_available():
+              y_npu = torch.ops.fbgemm.invert_permute(x.npu())
+              self.assertEqual(y_npu.device.type, 'privateuseone')
+              torch.testing.assert_close(y_cpu, y_npu.cpu())
+
+          # CUDA（如果可用）
+          if torch.cuda.is_available():
+              y_cuda = torch.ops.fbgemm.invert_permute(x.cuda())
+              self.assertEqual(y_cuda.device.type, 'cuda')
+              torch.testing.assert_close(y_cpu, y_cuda.cpu())
+
+  7.5 性能测试（C++）
+
+  在bench/目录添加NPU性能测试：
+  // fbgemm_gpu/bench/NPUInvertPermuteBenchmark.cc
+
+  #include <benchmark/benchmark.h>
+  #include <torch/torch.h>
+  #include <ATen/Functions.h>
+
+  #ifdef USE_NPU
+  #include <torch_npu/csrc/include/npu/functions/Helper.h>
+  #endif
+
+  static void BM_InvertPermute_NPU(benchmark::State& state) {
+  #ifdef USE_NPU
+    int64_t size = state.range(0);
+    auto x = torch::randperm(size, torch::kInt32);
+
+    if (torch::npu::is_available()) {
+      x = x.to(torch::kNPU);
+
+      for (auto _ : state) {
+        auto y = torch::ops::fbgemm::invert_permute(x);
+        torch_npu::utils::npu_lazy::NpuUtils::npu_synchronize();
+      }
+    }
+  #endif
+  }
+
+  BENCHMARK(BM_InvertPermute_NPU)
+      ->Range(1000, 1000000)
+      ->Unit(benchmark::kMicrosecond);
+
+  7.6 运行测试
+
+  # 运行NPU测试
+  python -m unittest fbgemm_gpu.test.npu.sparse_ops_test
+
+  # 运行所有NPU测试
+  python -m unittest discover -s fbgemm_gpu/test/npu
+
+  # 运行NPU性能测试
+  ./bench/NPUInvertPermuteBenchmark
+
+  这一节修正后是否符合FBGEMM的测试风格？
+
+❯ 没有多设备同时部署的场景，然后gpu和npu的结果没办法在一个用例里对比 
+
+● 你说得对！我的测试设计不切实际。让我修正：
+
+  第七章：测试策略（重新设计）
+
+  7.1 现实约束
+
+  实际部署场景：
+  - GPU环境：使用CUDA实现
+  - NPU环境：使用NPU实现
+  - 没有GPU+NPU混合部署场景
+
+  测试策略调整：
+  - 不能在同一用例中对比GPU和NPU结果
+  - 需要分别验证各设备的正确性
+  - 使用黄金数据或参考算法验证
+
+  7.2 NPU测试策略
+
+  方案A：使用CPU参考验证
+  # fbgemm_gpu/test/npu/sparse_ops_test.py
+
+  import unittest
+  import hypothesis.strategies as st
+  import torch
+  from hypothesis import given, settings, Verbosity
+
+  try:
+      from test_utils import npu_unavailable
+  except Exception:
+      from fbgemm_gpu.test.test_utils import npu_unavailable
+
+  class NPUInvertPermuteTest(unittest.TestCase):
+      """NPU算子测试 - 使用CPU作为参考"""
+
+      @unittest.skipIf(*npu_unavailable)
+      @given(
+          size=st.integers(min_value=1, max_value=10000),
+          dtype=st.sampled_from([torch.int32, torch.int64]),
+      )
+      @settings(verbosity=Verbosity.verbose, max_examples=20, deadline=None)
+      def test_invert_permute_correctness(self, size: int, dtype: torch.dtype) 
+  -> None:
+          """NPU vs CPU结果对比"""
+          # 生成输入
+          x = torch.randperm(size).to(dtype)
+
+          # CPU计算（参考）
+          y_cpu = torch.ops.fbgemm.invert_permute(x)
+
+          # NPU计算
+          x_npu = x.npu()
+          y_npu = torch.ops.fbgemm.invert_permute(x_npu)
+
+          # 验证结果一致
+          torch.testing.assert_close(
+              y_npu.cpu(),
+              y_cpu,
+              rtol=1e-5,
+              atol=1e-5,
+              msg=f"NPU和CPU结果不一致"
+          )
+
+  方案B：使用黄金数据文件
+  class NPUInvertPermuteTest(unittest.TestCase):
+      """使用预生成的黄金数据验证"""
+
+      def test_invert_permute_golden_data(self) -> None:
+          """使用标准测试用例"""
+          test_cases = [
+              (torch.tensor([1, 2, 0]), torch.tensor([2, 0, 1])),
+              (torch.tensor([0, 1, 2, 3]), torch.tensor([0, 1, 2, 3])),
+              (torch.tensor([3, 1, 2, 0]), torch.tensor([3, 1, 2, 0])),
+          ]
+
+          for input_tensor, expected_output in test_cases:
+              x_npu = input_tensor.npu()
+              y_npu = torch.ops.fbgemm.invert_permute(x_npu)
+
+              torch.testing.assert_close(
+                  y_npu.cpu(),
+                  expected_output,
+                  msg=f"输入 {input_tensor} 的输出不符合预期"
+              )
+
+  7.3 GPU测试保持不变
+
+  # fbgemm_gpu/test/sparse_ops_test.py (现有测试，保持不变)
+
+  class CUDAInvertPermuteTest(unittest.TestCase):
+      """CUDA算子测试 - GPU环境使用"""
+
+      @unittest.skipIf(*gpu_unavailable)
+      @given(size=st.integers(min_value=1, max_value=10000))
+      @settings(verbosity=Verbosity.verbose, max_examples=20)
+      def test_invert_permute_correctness(self, size: int) -> None:
+          """CUDA vs CPU结果对比"""
+          x = torch.randperm(size)
+
+          y_cpu = torch.ops.fbgemm.invert_permute(x)
+          y_cuda = torch.ops.fbgemm.invert_permute(x.cuda())
+
+          torch.testing.assert_close(y_cpu, y_cuda.cpu())
+
+  7.4 CI/CD分离
+
+  不同的CI环境：
+  # GPU环境CI（现有）
+  name: GPU Tests
+  runs-on: [self-hosted, gpu]
+  steps:
+    - run: python -m unittest fbgemm_gpu.test.sparse_ops_test
+
+  # NPU环境CI（新增）
+  name: NPU Tests
+  runs-on: [self-hosted, npu]
+  steps:
+    - run: python -m unittest fbgemm_gpu.test.npu.sparse_ops_test
+
+  7.5 分发器测试
+
+  class DispatcherTest(unittest.TestCase):
+      """测试设备路由逻辑"""
+
+      @unittest.skipIf(*npu_unavailable)
+      def test_npu_routing(self) -> None:
+          """测试NPU张量路由到NPU实现"""
+          x = torch.tensor([1, 2, 0]).npu()
+          y = torch.ops.fbgemm.invert_permute(x)
+
+          # 验证输出在NPU上
+          self.assertEqual(y.device.type, 'privateuseone')
+          self.assertEqual(y.device.index, 0)
+
+      def test_cpu_routing(self) -> None:
+          """测试CPU张量路由到CPU实现"""
+          x = torch.tensor([1, 2, 0])
+          y = torch.ops.fbgemm.invert_permute(x)
+
+          self.assertEqual(y.device.type, 'cpu')
+
+  7.6 性能对比（独立运行）
+
+  不在同一测试中对比：
+  # NPU性能测试（NPU环境运行）
+  def benchmark_npu():
+      """NPU环境下的性能"""
+      x = torch.randn(10000).to(torch.int32).npu()
+
+      for _ in range(100):
+          y = torch.ops.fbgemm.invert_permute(x)
+          torch.npu.synchronize()
+
+  # GPU性能测试（GPU环境运行）
+  def benchmark_gpu():
+      """GPU环境下的性能"""
+      x = torch.randn(10000).to(torch.int32).cuda()
+
+      for _ in range(100):
+          y = torch.ops.fbgemm.invert_permute(x)
+          torch.cuda.synchronize()
+
+  性能数据单独收集和对比，不在单元测试中进行。
+
+  这一节修正后是否合理？
+
+❯ 可以 
+
+● 很好，继续最后一章。
+
+  第八章：实施路线图
+
+  8.1 总体时间规划
+
+  阶段1: 框架搭建 (2-3周)
+    ├── CMake配置
+    ├── 目录结构创建
+    ├── 分发器实现
+    └── 工具函数库
+
+  阶段2: 示例算子实现 (1-2周)
+    ├── 选取1-2个简单算子
+    ├── AscendC实现
+    ├── Wrapper实现
+    └── 单元测试
+
+  阶段3: 核心算子适配 (4-6周)
+    ├── 稀疏算子
+    ├── 量化算子
+    └── 性能优化
+
+  阶段4: 测试和验证 (2-3周)
+    ├── 完善单元测试
+    ├── 集成测试
+    └── 性能调优
+
+  阶段5: 文档和发布 (1-2周)
+    ├── 开发文档
+    ├── 用户文档
+    └── 提交PR
+
+  8.2 阶段1：框架搭建
+
+  目标：建立完整的NPU适配框架，无功能算子
+
+  任务清单：
+
+  1. CMake配置
+    - 添加USE_NPU选项
+    - CANN工具链检测
+    - 创建fbgemm_gpu/src/npu/CMakeLists.txt
+    - 创建fbgemm_gpu/src/npu/ascendc/CMakeLists.txt
+  2. 目录结构创建
+  mkdir -p fbgemm_gpu/src/npu/{dispatch,sparse_ops,quantize_ops,utils}
+  mkdir -p fbgemm_gpu/src/npu/ascendc/invert_permute/{op_host,op_kernel}
+  3. 分发器实现
+    - fbgemm_gpu/src/npu/dispatch/dispatcher.h
+    - fbgemm_gpu/src/npu/dispatch/sparse_ops.cpp
+    - 测试分发器路由逻辑
+  4. 工具函数库
+    - fbgemm_gpu/src/npu/utils/npu_ops_utils.h
+    - fbgemm_gpu/src/npu/utils/npu_type_utils.h
+    - TENSOR_ON_NPU宏
+    - NPUDeviceGuard类
+  5. 测试框架
+    - 创建fbgemm_gpu/test/npu/目录
+    - 扩展test_utils.py添加npu_unavailable
+    - 创建CI配置模板
+
+  验收标准：
+  - ✅ cmake -DUSE_NPU=ON可以成功配置
+  - ✅ 编译生成libfbgemm_npu_wrapper.a
+  - ✅ 分发器可以正确路由CPU张量
+
+  8.3 阶段2：示例算子实现
+
+  目标：实现1-2个简单算子，验证完整流程
+
+  选择算子：invert_permute（简单、无状态）
+
+  任务清单：
+
+  1. AscendC实现
+    - op_host/invert_permute.cpp
+    - op_host/invert_permute_tiling.h
+    - op_kernel/invert_permute.cpp
+    - op_kernel/invert_permute_kernel.h
+    - 独立编译测试
+  2. NPU Wrapper实现
+    - sparse_ops/invert_permute.cpp
+    - 类型调度（int32/int64）
+    - 边界检查
+  3. 分发器集成
+    - 在dispatcher.h中声明
+    - 在sparse_ops.cpp中注册
+  4. 单元测试
+    - 正确性测试（vs CPU）
+    - 边界条件测试
+    - 错误处理测试
+
+  验收标准：
+  - ✅ torch.ops.fbgemm.invert_permute(npu_tensor)正确执行
+  - ✅ 单元测试通过率100%
+  - ✅ 与CPU结果数值一致
+
+  8.4 阶段3：核心算子适配
+
+  目标：适配推荐系统核心算子
+
+  优先级排序：
+  ┌────────┬───────────┬────────────────────────┬────────┐
+  │ 优先级 │ 算子类型  │        典型算子        │ 复杂度 │
+  ├────────┼───────────┼────────────────────────┼────────┤
+  │ P0     │ 稀疏算子  │ permute_1d, permute_2d │ 低     │
+  ├────────┼───────────┼────────────────────────┼────────┤
+  │ P0     │ 稀疏算子  │ index_select_dim0      │ 中     │
+  ├────────┼───────────┼────────────────────────┼────────┤
+  │ P1     │ 稀疏算子  │ pack_segments          │ 中     │
+  ├────────┼───────────┼────────────────────────┼────────┤
+  │ P1     │ 量化算子  │ quantize, dequantize   │ 低     │
+  ├────────┼───────────┼────────────────────────┼────────┤
+  │ P2     │ Embedding │ split_embedding_lookup │ 高     │
+  └────────┴───────────┴────────────────────────┴────────┘
+  并行开发策略：
+  - 昇腾团队：2-3人并行开发不同算子
+  - 每完成一个算子立即提交测试
+  - 每周同步进度和问题
+
+  8.5 阶段4：测试和验证
+
+  目标：确保质量和性能
+
+  任务清单：
+
+  1. 单元测试完善
+    - 每个算子覆盖4种类型
+    - 边界条件测试
+    - 错误输入测试
+  2. 集成测试
+    - 分发器路由测试
+    - 多算子组合测试
+    - 端到端场景测试
+  3. 性能测试
+    - 不同数据规模测试
+    - Tiling参数调优
+    - vs CPU性能对比
+  4. CI/CD集成
+    - NPU CI环境配置
+    - 自动化测试流程
+    - 性能回归检测
+
+  验收标准：
+  - ✅ 单元测试覆盖率 > 90%
+  - ✅ 所有集成测试通过
+  - ✅ 性能达到预期目标
+
+  8.6 阶段5：文档和发布
+
+  目标：准备合入主分支
+
+  任务清单：
+
+  1. 开发文档
+    - 架构设计文档
+    - 编译指南
+    - 算子开发指南
+    - 调试指南
+  2. 用户文档
+    - NPU支持说明
+    - 安装指南
+    - 迁移指南（CUDA→NPU）
+  3. 代码审查准备
+    - 清理临时代码
+    - 代码注释完善
+    - 合入commit message规范
+  4. 提交PR
+    - 分拆为多个小PR（按模块）
+    - 每个PR独立可测试
+    - 提供详细的变更说明
+
+  8.7 风险和应对
+  ┌───────────────────┬──────┬──────┬───────────────────────────────┐
+  │       风险        │ 影响 │ 概率 │           应对措施            │
+  ├───────────────────┼──────┼──────┼───────────────────────────────┤
+  │ AscendC工具链问题 │ 高   │ 中   │ 提前验证工具链，准备备选方案  │
+  ├───────────────────┼──────┼──────┼───────────────────────────────┤
+  │ 性能不达标        │ 高   │ 中   │ 预留性能优化时间，邀请NPU专家 │
+  ├───────────────────┼──────┼──────┼───────────────────────────────┤
+  │ 与FBGEMM设计冲突  │ 中   │ 低   │ 早期与FBGEMM团队对齐设计      │
+  ├───────────────────┼──────┼──────┼───────────────────────────────┤
+  │ CI环境不稳定      │ 中   │ 中   │ 建立稳定的NPU测试环境         │
+  ├───────────────────┼──────┼──────┼───────────────────────────────┤
+  │ 资源不足          │ 高   │ 低   │ 合理规划优先级，聚焦核心算子  │
+  └───────────────────┴──────┴──────┴───────────────────────────────┘
+  8.8 成功标准
+
+  框架合入标准：
+  - ✅ 零侵入现有CUDA/CPU代码
+  - ✅ 编译可选（USE_NPU=OFF不影响）
+  - ✅ 代码符合FBGEMM规范
+  - ✅ 通过所有CI测试
+
+  功能完成标准（MVP）：
+  - ✅ 支持5个核心稀疏算子
+  - ✅ 支持2个量化算子
+  - ✅ 单元测试覆盖率 > 90%
+  - ✅ 在实际模型中验证通过
+
+  ---
+  设计文档的所有章节已完成。是否需要我将完整文档整理输出？
+
+❯ 好的，整理文档输出 
+
+● Bash(date +%Y-%m-%d)
+  ⎿  2026-01-24
+
+● Write(docs/plans/2026-01-24-npu-adaptation-design.md)
+  ⎿  Wrote 1147 lines to docs/plans/2026-01-24-npu-adaptation-design.md
+      1 # FBGEMM_GPU昇腾NPU适配方案设计文档
+      2 **项目**: FBGEMM_GPU Ascend NPU Backend Adaptation
+      3 **日期**: 2026-01-24
+      4 **版本**: v1.0
+      5 **状态**: 设计阶段
+      6 ---
+      7 ## 文档修订历史
+     … +1137 lines (ctrl+o to expand)
+
+● 完成！设计文档已整理输出到：
+
+  📄 docs/plans/2026-01-24-npu-adaptation-design.md
+
+  文档包含内容：
+
+  核心章节
+
+  1. 总体架构设计 - 设计目标、分层架构、目录组织
+  2. 核心组件设计 - 分发器、三层架构、Tiling机制
+  3. 编译系统设计 - 两阶段编译、CMake配置
+  4. 类型系统设计 - 类型映射、工具函数
+  5. 算子注册和分发机制 - 与CUDA保持一致
+  6. 错误处理和日志 - 错误处理策略、日志系统
+  7. 测试策略 - unittest框架、CI/CD分离
+  8. 实施路线图 - 5阶段实施计划、风险应对
+
+  附录
+
+  - 参考文档
+  - 术语表
+  - 联系方式
+
+  关键设计亮点：
+
+  ✅ 零侵入 - 不修改现有CUDA/CPU代码
+  ✅ 完全解耦 - NPU代码独立，便于并行开发
+  ✅ 性能优先 - C++层分发，开销~10ns
+  ✅ 易于合入 - 符合FBGEMM规范，owner审查成本低
+  ✅ 可选依赖 - 默认关闭，不影响其他开发者
+
+  文档已准备就绪，可以作为后续实施的蓝图！
