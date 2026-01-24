@@ -51,6 +51,11 @@ gpu_unavailable: tuple[bool, str] = (
 )
 # Used for `if` statements inside tests
 gpu_available: bool = not gpu_unavailable[0]
+npu_unavailable: tuple[bool, str] = (
+    not hasattr(torch, 'npu') or not torch.npu.is_available(),
+    "NPU is not available"
+)
+npu_available: bool = not npu_unavailable[0]
 
 is_nvidia_device: bool = gpu_available and torch.version.cuda is not None
 

@@ -67,6 +67,17 @@ else()
 endif()
 
 ################################################################################
+# NPU Support (Optional)
+################################################################################
+
+# NPU backend support - completely optional
+option(USE_NPU "Build with Ascend NPU support" OFF)
+
+if(USE_NPU)
+  message(STATUS "NPU support requested - will check for CANN toolkit")
+endif()
+
+################################################################################
 # FBGEMM_GPU Build Kickstart
 ################################################################################
 
@@ -294,6 +305,11 @@ elseif(FBGEMM_BUILD_TARGET STREQUAL BUILD_TARGET_HSTU)
   add_subdirectory(experimental/hstu)
 
 elseif(FBGEMM_BUILD_TARGET STREQUAL BUILD_TARGET_DEFAULT)
+  # Build NPU backend if enabled
+  if(USE_NPU)
+    add_subdirectory(src/npu)
+  endif()
+  
   # Build FBGEMM_GPU
   include(FbgemmGpu.cmake)
 endif()

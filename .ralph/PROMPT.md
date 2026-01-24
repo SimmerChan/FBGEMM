@@ -49,6 +49,7 @@ This project adds complete Ascend NPU backend support to FBGEMM_GPU while mainta
 6. **Testing**: Compare NPU results against CPU, not GPU (different deployment scenarios)
 7. **Error Handling**: Follow FBGEMM error message conventions (TENSOR_ON_NPU macro, etc.)
 8. **Naming**: Extend `fbgememm_gpu` namespace with `npu` sub-namespace
+9. **Implementation**: All operators must be implemented in AscendC exactly following the implementation in /home/hsl/RecSDK/cust_op/ including kernel, host tiling and pytorch registration
 
 ## Technical Constraints
 - **Language**: C++17 for wrappers, AscendC for kernels
