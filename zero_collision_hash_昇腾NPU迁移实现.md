@@ -27,6 +27,49 @@
 - **SIMT接口适用范围**：仅A5代际（如c310）芯片可使用本方案中的SIMT实现
 - **A2/A3芯片**：如需支持，需要使用非SIMT接口（见第4.5节）
 
+### 1.4 开发环境
+
+本算子的开发和调试在远端昇腾NPU服务器上进行，环境信息如下：
+
+| 项目 | 信息 |
+|-----|------|
+| 服务器地址 | `192.168.13.158` |
+| SSH端口 | `22` |
+| 用户名 | `root` |
+| 密码 | `DCauto1!2@` |
+| 容器名称 | `hsl_pt` |
+| 工作路径 | `/home/hsl` |
+| 目标芯片 | A5 950PR (c310) |
+
+**连接与开发流程**：
+
+```bash
+# 1. SSH连接到服务器
+ssh root@192.168.13.158
+
+# 2. 进入容器
+docker exec -it hsl_pt bash
+
+# 3. 进入工作目录
+cd /home/hsl
+
+# 4. 算子代码位于
+# /home/hsl/zero_collision_hash/
+```
+
+**环境变量**（容器内已预装）：
+
+```bash
+# Ascend Toolkit 路径
+export ASCEND_HOME=/usr/local/Ascend
+export ASCEND_TOOLKIT_HOME=${ASCEND_HOME}/ascend-toolkit/latest
+export PATH=${ASCEND_TOOLKIT_HOME}/bin:${PATH}
+export LD_LIBRARY_PATH=${ASCEND_TOOLKIT_HOME}/lib64:${LD_LIBRARY_PATH}
+
+# ccec编译器路径
+# /usr/local/Ascend/ascend-toolkit/latest/bin/ccec
+```
+
 ---
 
 ## 二、适配到 fbgemm-ascend 仓库的目录结构
@@ -1676,8 +1719,7 @@ __device__ __host__ __inline__ uint64_t murmur_hash3_2x64(uint64_t x, uint64_t y
 
 **参考来源**：原始实现在`fbgemm_gpu/include/fbgemm_gpu/faster_hash_ops/common_utils.cuh`
 
-### 8.2 探测模式模板化
-
+### 9.2 探测模式模板化
 **两种探测模式**：
 | 模式 | CUDA实现 | 昇腾SIMT实现 |
 |-----|---------|-------------|
