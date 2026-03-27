@@ -1017,40 +1017,55 @@ extern "C" __global__ __aicore__ void zero_collision_hash(GM_ADDR input, GM_ADDR
 
 ## 四、SIMT接口映射关系
 
-### 4.1 CUDA到SIMT接口对照表
+本节基于 **RecSDK/cust_op** 和 **HierarchicalKV-ascend** 两个项目的实际代码，分析 `zero_collision_hash` 算子迁移所需的所有接口映射关系。
 
-| CUDA接口 | 昇腾SIMT接口 | 功能说明 | 接口来源（已知使用的算子） |
-|---------|-------------|---------|---------------------------|
-| `threadIdx.x` | `AscendC::Simt::GetThreadIdx<0>()` | 获取线程索引 | RecSDK: split_embedding, backward_codegen, asynchronous_cumsum, block_bucketize, invert_permute<br>HierarchicalKV: insert_or_assign |
-| `blockIdx.x` | `AscendC::Simt::GetBlockIdx()` | 获取块索引 | RecSDK: split_embedding, asynchronous_cumsum, block_bucketize, invert_permute |
-| `blockDim.x` | `AscendC::Simt::GetThreadNum<0>()` | 获取块内线程数 | RecSDK: split_embedding, backward_codegen, asynchronous_cumsum, block_bucketize |
-| `gridDim.x` | `AscendC::Simt::GetBlockNum()` | 获取块数量 | RecSDK: split_embedding |
-| `atomicCAS()` | `AscendC::Simt::AtomicCas()` | 原子比较交换 | RecSDK: backward_codegen_dedup<br>HierarchicalKV: insert_or_assign |
-| `atomicExch()` | `AscendC::Simt::AtomicExch()` | 原子交换 | HierarchicalKV: insert_or_assign |
-| `atomicAdd()` | `AscendC::Simt::AtomicAdd()` | 原子加 | RecSDK: backward_codegen_dedup<br>HierarchicalKV: insert_or_assign |
-| `__syncthreads()` | `AscendC::Simt::ThreadBarrier()` | 线程同步 | RecSDK: backward_codegen, asynchronous_cumsum, block_bucketize |
-| `__shfl()` | `__shfl()` | 线程束洗牌 | HierarchicalKV: insert_or_assign |
-| `__shfl_xor()` | `__shfl_xor()` | 线程束异或洗牌 | HierarchicalKV: insert_or_assign |
-| `WarpReduceAddSync()` | `AscendC::Simt::WarpReduceAddSync()` | 线程束归约加法 | RecSDK: split_embedding |
-| `WarpShflUpSync()` | `AscendC::Simt::WarpShflUpSync()` | 线程束向上洗牌 | RecSDK: asynchronous_cumsum, block_bucketize |
-| - | `AscendC::Simt::VF_CALL<Kernel>()` | 启动SIMT kernel | RecSDK: 所有SIMT算子<br>HierarchicalKV: 所有哈希表算子 |
-| - | `AscendC::Simt::Dim3{x, y, z}` | 定义线程维度 | RecSDK: 所有SIMT算子 |
-| - | `__simt_vf__` | 声明SIMT函数 | RecSDK: 所有SIMT算子<br>HierarchicalKV: 所有哈希表算子 |
+### 4.1 接口映射总览
 
-### 4.2 缺少的SIMT接口分析
+| 映射状态 | 接口类别 | 说明 |
+|---------|---------|------|
+| ✅ **完全支持** | SIMT核心接口 | 线程索引、原子操作(CAS/Add/Exch)、同步、warp操作等 |
+| ⚠️ **需要适配** | atomicMax | 需要用CAS循环实现，或用SetAtomicMax配合DataCopy |
+| ✅ **框架层处理** | PyTorch/CUDA运行时 | 张量转换、Kernel启动、算子注册等 |
 
-通过对比GPU版本的`zero_collision_hash`实现（`fbgemm_gpu/src/faster_hash_ops/faster_hash.cu`）与上述SIMT接口映射表，发现以下CUDA接口在昇腾SIMT中没有直接对应的接口：
+### 4.2 完全支持的SIMT接口
 
-| CUDA接口 | 功能说明 | GPU实现中的使用位置 | 昇腾适配方案 |
-|---------|---------|-------------------|-------------|
-| `atomicMax()` | 原子最大值更新，用于更新metadata时间戳 | `faster_hash.cu:63` - `update_metadata<1>()`函数中 | **需要自行实现**：可通过CAS循环实现或使用`SetAtomicMax<T>()`配合DataCopy（仅支持特定类型） |
-| `atomicCAS()` (int64_t) | 64位原子比较交换，标准atomicCAS只支持32位 | `faster_hash.cu:43-55` - `CAS<int64_t>()`特化版本 | **需要特殊处理**：使用`reinterpret_cast`转换为`unsigned long long`后调用32位CAS两次，或检查SIMT API是否支持64位 |
-| `__device__` | 设备函数声明限定符 | `faster_hash.cu:36,41,50,59,77,92,115,169,178,198,212,228` 等多处 | 对应`__aicore__`，已在文档中隐含说明 |
-| `__global__` | Kernel函数声明限定符 | `faster_hash.cu:264,414` - `process_item_zch` kernel定义 | 对应`extern "C" __global__ __aicore__`，已在文档中说明 |
+以下CUDA接口在昇腾SIMT中有直接对应的接口，可直接替换使用：
 
-#### 4.2.1 atomicMax实现方案
+| CUDA接口 | 昇腾SIMT接口 | 功能说明 | 接口来源（实际使用项目） |
+|---------|-------------|---------|------------------------|
+| `threadIdx.x` | `AscendC::Simt::GetThreadIdx<0>()` | 获取线程索引 | RecSDK, HierarchicalKV |
+| `blockIdx.x` | `AscendC::Simt::GetBlockIdx()` | 获取块索引 | RecSDK, HierarchicalKV |
+| `blockDim.x` | `AscendC::Simt::GetThreadNum<0>()` | 获取块内线程数 | RecSDK, HierarchicalKV |
+| `gridDim.x` | `AscendC::Simt::GetBlockNum()` | 获取块数量 | RecSDK, HierarchicalKV |
+| `atomicCAS()` | `AscendC::Simt::AtomicCas()` | 原子比较交换（**支持64位**） | RecSDK, HierarchicalKV |
+| `atomicExch()` | `AscendC::Simt::AtomicExch()` | 原子交换 | HierarchicalKV |
+| `atomicAdd()` | `AscendC::Simt::AtomicAdd()` | 原子加 | RecSDK, HierarchicalKV |
+| `__syncthreads()` | `AscendC::Simt::ThreadBarrier()` | 线程同步 | RecSDK |
+| `__shfl()` | `__shfl()` | 线程束洗牌 | HierarchicalKV |
+| `__shfl_xor()` | `__shfl_xor()` | 线程束异或洗牌 | HierarchicalKV |
+| `WarpReduceAddSync()` | `AscendC::Simt::WarpReduceAddSync()` | 线程束归约加法 | RecSDK |
+| `WarpShflUpSync()` | `AscendC::Simt::WarpShflUpSync()` | 线程束向上洗牌 | RecSDK |
+| - | `AscendC::Simt::VF_CALL<Kernel>()` | 启动SIMT kernel | RecSDK, HierarchicalKV |
+| - | `AscendC::Simt::Dim3{x, y, z}` | 定义线程维度 | RecSDK, HierarchicalKV |
+| - | `__simt_vf__` | 声明SIMT函数 | RecSDK, HierarchicalKV |
 
-GPU代码中的使用场景（`faster_hash.cu:63`）：
+**重要说明 - 64位AtomicCas已支持**：
+
+GPU版本中使用的 `int64_t CAS` 不需要特殊处理。HierarchicalKV项目已验证 `AtomicCas` 支持 `uint64_t` 类型：
+
+```cpp
+// HierarchicalKV 实际代码 (insert_or_assign_kernel.h)
+template <typename K = uint64_t, typename V = float, typename S = uint64_t>
+// K 默认为 uint64_t，直接用于 AtomicCas
+auto try_key = Simt::AtomicCas(current_key_ptr, key, static_cast<K>(LOCKED_KEY));
+```
+
+### 4.3 需要适配的接口
+
+#### 4.3.1 atomicMax - 唯一需要适配的SIMT接口
+
+**GPU使用位置**：`faster_hash.cu:63` - 更新metadata时间戳
+
 ```cpp
 template <>
 __device__ __inline__ void update_metadata<1>(
@@ -1061,11 +1076,10 @@ __device__ __inline__ void update_metadata<1>(
 }
 ```
 
-**昇腾SIMT适配方案**：
+**适配方案一：CAS循环实现（推荐，通用方案）**
 
-方案一：CAS循环实现
 ```cpp
-__aicore__ inline void AtomicMax(__gm__ int32_t* addr, int32_t value) {
+__aicore__ inline void AtomicMaxInt32(__gm__ int32_t* addr, int32_t value) {
     int32_t old = *addr;
     while (value > old) {
         int32_t expected = old;
@@ -1075,75 +1089,33 @@ __aicore__ inline void AtomicMax(__gm__ int32_t* addr, int32_t value) {
 }
 ```
 
-方案二：使用AscendC的SetAtomicMax（仅限特定场景）
+**适配方案二：SetAtomicMax + DataCopy（仅支持int8_t）**
+
+RecSDK中的实际使用案例（`backward_codegen_unweighted_exact_kernel.h:146`）：
+
 ```cpp
-// 注意：SetAtomicMax仅支持int8_t等有限类型
 SetAtomicMax<int8_t>();
-DataCopy(dst, src, len);
+DataCopy(this->updateMaskGT_[thisIndForTotalTable], newFlagOutLt, FLAG_LEN);
 SetAtomicNone();
 ```
 
-#### 4.2.2 int64_t原子CAS实现方案
+> ⚠️ **限制**：`SetAtomicMax<T>()` 仅支持 `int8_t` 等有限类型，不适用于 `int32_t` 的metadata更新场景。
 
-GPU代码中的使用场景（`faster_hash.cu:43-55`）：
-```cpp
-template <>
-__device__ __inline__ int64_t CAS<int64_t>(int64_t* data, int64_t cmp, int64_t val) {
-  return static_cast<int64_t>(atomicCAS(
-      reinterpret_cast<unsigned long long*>(data),
-      static_cast<unsigned long long>(cmp),
-      static_cast<unsigned long long>(val)));
-}
-```
+### 4.4 框架层接口（非SIMT，方案明确）
 
-**昇腾SIMT适配方案**：
-
-方案一：检查API是否支持64位（需查阅最新文档）
-```cpp
-// 如果SIMT API支持64位CAS
-uint64_t old = AscendC::Simt::AtomicCas(
-    reinterpret_cast<__gm__ uint64_t*>(addr),
-    static_cast<uint64_t>(expected),
-    static_cast<uint64_t>(desired));
-```
-
-方案二：使用32位CAS组合实现（兼容性更好）
-```cpp
-// 将64位操作拆分为两个32位CAS
-// 注意：非原子操作，高并发下可能有竞态条件
-__aicore__ inline int64_t AtomicCas64(
-    __gm__ int64_t* addr, int64_t expected, int64_t desired) {
-    // 实现略，需要考虑内存对齐和竞态条件
-    // 建议优先使用API原生64位支持
-}
-```
-
-#### 4.2.3 其他发现的昇腾特有接口
-
-| 接口 | 功能说明 | 使用位置 | 备注 |
-|-----|---------|---------|------|
-| `asc_atomic_add()` | UB（Unified Buffer）上的原子加，仅支持int32_t | RecSDK: `block_bucketize_sparse_features_kernel.h:571,719` | 用于本地缓冲区的原子计数，可替代部分atomicAdd场景 |
-| `SetAtomicMax<T>()` | 设置全局内存原子Max模式 | RecSDK: `backward_codegen_unweighted_exact_kernel.h:146` | 配合DataCopy使用，仅支持int8_t等有限类型 |
-
-### 4.2.4 其他缺少映射关系的接口（非SIMT）
-
-基于 **RecSDK/cust_op** 和 **HierarchicalKV-ascend** 两个项目的实际适配案例，分析GPU版本中使用的PyTorch/CUDA框架接口在昇腾上的映射关系：
+以下接口不属于SIMT范畴，在框架层处理，参考项目中有明确的适配模式：
 
 #### 一、PyTorch张量到ACL张量转换
 
-| GPU接口 | 功能说明 | GPU使用位置 | 昂腾适配方案（参考实际代码） |
-|---------|---------|------------|----------------------------|
-| `at::Tensor` | PyTorch张量类型 | 函数参数和返回值 | **RecSDK**: 使用`ConvertType(const at::Tensor&)`转换为`aclTensor*`<br>**HKV**: 使用`DeviceTensor`类封装后调用`convert_type()` |
-| `at::PackedTensorAccessor64<T,N,Traits>` | 打包张量访问器 | `faster_hash.cu:100,123,265-268` | 直接使用`__gm__ T*`原始指针，从tiling获取shape信息 |
-| `.data_ptr<T>()` | 获取底层数据指针 | `faster_hash.cu:605-620` | **RecSDK**: 直接传入`at::Tensor`，由`ConvertType()`内部获取<br>**HKV**: `DeviceTensor::get_data()` |
-| `.size(i)` / `.numel()` | 获取张量维度信息 | 多处使用 | 通过`aclrtLaunch*Kernel`参数传递，或从tiling数据获取 |
+| GPU接口 | 昂腾适配方案 | 参考来源 |
+|---------|------------|---------|
+| `at::Tensor` | `ConvertType(const at::Tensor&)` → `aclTensor*` | RecSDK: `pytorch_npu_helper.hpp` |
+| `at::PackedTensorAccessor64` | 使用 `__gm__ T*` 原始指针 | HierarchicalKV: 所有kernel |
+| `.data_ptr<T>()` | `DeviceTensor::get_data()` | HierarchicalKV: `aclnn_helper.h` |
 
-**RecSDK 实际代码示例** (`pytorch_npu_helper.hpp:141-162`):
+**RecSDK 实际代码**：
 ```cpp
-inline aclTensor* ConvertType(const at::Tensor& at_tensor)
-{
-    static const auto aclCreateTensor = GET_OP_API_FUNC(aclCreateTensor);
-    // ... 类型转换逻辑 ...
+inline aclTensor* ConvertType(const at::Tensor& at_tensor) {
     auto acl_tensor = aclCreateTensor(
         at_tensor.sizes().data(), at_tensor.sizes().size(), 
         acl_data_type, at_tensor.strides().data(),
@@ -1153,61 +1125,34 @@ inline aclTensor* ConvertType(const at::Tensor& at_tensor)
 }
 ```
 
-**HierarchicalKV 实际代码示例** (`aclnn_helper.h:100-112`):
-```cpp
-inline aclTensor* convert_type(const DeviceTensor& tensor) {
-  auto shape = tensor.get_shapes_data();
-  auto shape_size = tensor.get_shapes_size();
-  // ... stride计算 ...
-  auto target_tensor = aclCreateTensor(
-      shape, shape_size, tensor.get_data_type(), strides.data(), 0,
-      aclFormat::ACL_FORMAT_ND, shape, shape_size, tensor.get_data());
-  return target_tensor;
-}
-```
-
 #### 二、CUDA Kernel启动方式
 
-| GPU方式 | 功能说明 | 昂腾适配方案（参考实际代码） |
-|--------|---------|----------------------------|
-| `<<<grid, block, shared_mem, stream>>>` | CUDA kernel启动语法 | **自定义kernel**: `aclrtLaunch*Kernel()`<br>**ACL NN算子**: `EXEC_NPU_CMD(aclnn_api, ...)` 或 `EXEC_ACLNN_OP(aclnn_api, ...)` |
-| `FBGEMM_LAUNCH_DSA_KERNEL` | FBGEMM封装的kernel启动宏 | 替换为`aclrtLaunch*Kernel`或`Simt::VF_CALL` |
+| GPU方式 | 昂腾适配方案 | 参考来源 |
+|--------|------------|---------|
+| `<<<grid, block, shared_mem, stream>>>` | `Simt::VF_CALL<Kernel>(Dim3{...}, args...)` | HierarchicalKV |
+| 自定义kernel | `extern "C" __global__ __aicore__ void kernel_name(...)` | RecSDK, HierarchicalKV |
+| ACL NN算子 | `EXEC_NPU_CMD(aclnn_api, ...)` | RecSDK |
 
-**HierarchicalKV 实际代码示例** (`find_ptr_kernel.cpp:27-36`):
+**HierarchicalKV 实际代码**：
 ```cpp
-extern "C" __global__ __aicore__ void find_ptr_kernel(
-    GM_ADDR buckets, uint64_t buckets_num, ...) {
+extern "C" __global__ __aicore__ void find_ptr_kernel(...) {
   KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_AIV_ONLY);
-  const uint64_t thread_all = THREAD_NUM * GetBlockNum();
-  DISPATCH_VALUE_SIZE(value_size,
-      (Simt::VF_CALL<find_ptr_kernel_vf<uint64_t, DTYPE, uint64_t>>(
-          Simt::Dim3{static_cast<uint32_t>(THREAD_NUM), 1, 1}, 
-          buckets, buckets_num, ...)));
+  Simt::VF_CALL<find_ptr_kernel_vf<...>>(
+      Simt::Dim3{static_cast<uint32_t>(THREAD_NUM), 1, 1}, ...);
 }
-```
-
-**RecSDK 实际代码示例** (`split_embedding_codegen_forward_unweighted.cpp:87-89`):
-```cpp
-EXEC_NPU_CMD(aclnnSplitEmbeddingCodegenForwardUnweighted, 
-             dev_weights, uvm_weights, lxu_cache_weights,
-             weights_placements, weights_offsets, ...);
 ```
 
 #### 三、PyTorch算子注册机制
 
-| GPU接口 | 功能说明 | 昂腾适配方案（参考RecSDK实际代码） |
-|---------|---------|----------------------------------|
-| `TORCH_LIBRARY_FRAGMENT(name, m)` | 声明算子库片段 | **保持不变**，与GPU相同 |
-| `TORCH_LIBRARY_IMPL(name, device, m)` | 注册设备实现 | **修改DispatchKey**: `c10::DispatchKey::Autograd` |
-| `c10::DispatchKey::CPU/CUDA/Meta` | 设备类型分发键 | 使用`c10::DispatchKey::Autograd`，NPU设备自动处理 |
-| `TORCH_FN(func)` | 函数包装宏 | **保持不变** |
+| GPU接口 | 昂腾适配方案 | 说明 |
+|---------|------------|------|
+| `TORCH_LIBRARY_FRAGMENT` | **保持不变** | 与GPU相同 |
+| `c10::DispatchKey::CUDA` | `c10::DispatchKey::Autograd` | NPU设备自动处理 |
 
-**RecSDK 实际代码示例** (`split_embedding_codegen_forward_unweighted.cpp:98-108`):
+**RecSDK 实际代码**：
 ```cpp
-TORCH_LIBRARY_FRAGMENT(fbgemm, m)
-{
+TORCH_LIBRARY_FRAGMENT(fbgemm, m) {
     m.def("split_embedding_codegen_forward_unweighted_cuda(...)");
-    
     m.impl("split_embedding_codegen_forward_unweighted_cuda",
         torch::dispatch(c10::DispatchKey::Autograd,
                         TORCH_FN(fbgemm_npu_lookups::split_embedding_codegen_forward_unweighted_npu)));
@@ -1216,87 +1161,29 @@ TORCH_LIBRARY_FRAGMENT(fbgemm, m)
 
 #### 四、CUDA运行时接口
 
-| GPU接口 | 功能说明 | 昂腾适配方案（参考实际代码） |
-|---------|---------|----------------------------|
-| `at::cuda::getCurrentCUDAStream()` | 获取CUDA流 | `c10_npu::getCurrentNPUStream().stream(false)` (RecSDK) |
-| `at::cuda::getCurrentDeviceProperties()` | 获取设备属性 | `platform_ascendc::PlatformAscendC::GetCoreNumAiv()` |
-| `aclrtMemcpy` | 设备内存拷贝 | `aclrtMemcpy(ptr, size, src, size, ACL_MEMCPY_DEVICE_TO_DEVICE)` |
-| `aclrtMalloc` / `aclrtFree` | 设备内存分配/释放 | ACL原生接口，见HKV的`DeviceTensor`类 |
+| GPU接口 | 昂腾适配方案 |
+|---------|------------|
+| `at::cuda::getCurrentCUDAStream()` | `c10_npu::getCurrentNPUStream().stream(false)` |
+| `at::cuda::getCurrentDeviceProperties()` | `platform_ascendc::PlatformAscendC::GetCoreNumAiv()` |
+| `cudaMalloc/cudaFree` | `aclrtMalloc/aclrtFree` |
+| `cudaMemcpy` | `aclrtMemcpy(..., ACL_MEMCPY_DEVICE_TO_DEVICE)` |
 
-**HierarchicalKV 内存管理示例** (`aclnn_helper.h:33-48`):
-```cpp
-class DeviceTensor {
- public:
-  void init(aclDataType in_type, std::vector<int64_t>&& in_shapes) {
-    data_size = get_acl_data_type_size(in_type) * get_shape_size(in_shapes);
-    auto ret = aclrtMalloc(&data, data_size, ACL_MEM_MALLOC_HUGE_FIRST);
-    NPU_CHECK(ret);
-    // ...
-  }
-  ~DeviceTensor() {
-    if (clear_flag && (data != nullptr)) {
-      (void)aclrtFree(data);
-    }
-  }
-};
-```
+### 4.5 接口适配状态总结
 
-#### 五、ACL NN算子调用封装
+| 状态 | 接口 | 数量 | 说明 |
+|-----|------|-----|------|
+| ✅ 直接替换 | 线程索引、原子操作(CAS/Add/Exch)、同步、warp操作 | 14个 | 有直接对应的SIMT接口 |
+| ⚠️ 需要适配 | atomicMax | 1个 | 用CAS循环实现 |
+| ✅ 框架层处理 | 张量转换、Kernel启动、算子注册、运行时接口 | 多个 | 参考项目有明确模式 |
 
-| 宏/接口 | 功能说明 | 使用位置 |
-|--------|---------|---------|
-| `EXEC_NPU_CMD(aclnn_api, ...)` | RecSDK封装的ACL NN调用宏 | `pytorch_npu_helper.hpp` |
-| `EXEC_ACLNN_OP(aclnn_api, ...)` | HKV封装的ACL NN调用宏 | `aclnn_helper.h` |
+**结论**：`zero_collision_hash` 算子迁移所需的接口全部可以找到对应映射，**不存在完全不支持的接口**。唯一需要自行实现的是 `atomicMax`，可通过CAS循环简单实现。
 
-**EXEC_NPU_CMD 实现原理** (`pytorch_npu_helper.hpp:269-305`):
-```cpp
-#define EXEC_NPU_CMD(aclnn_api, ...)                                                                                   \
-    do {                                                                                                               \
-        /* 动态加载API */                                                                                              \
-        static const auto getWorkspaceSizeFuncAddr = GetOpApiFuncAddr(#aclnn_api "GetWorkspaceSize");                  \
-        static const auto opApiFuncAddr = GetOpApiFuncAddr(#aclnn_api);                                                \
-        /* 获取NPU流 */                                                                                                \
-        auto acl_stream = c10_npu::getCurrentNPUStream().stream(false);                                                \
-        /* 类型转换 */                                                                                                 \
-        auto converted_params = ConvertTypes(__VA_ARGS__, workspace_size_addr, executor_addr);                         \
-        /* 计算workspace大小 */                                                                                        \
-        auto workspace_status = call(getWorkspaceSizeFunc, converted_params);                                          \
-        /* 分配workspace并执行 */                                                                                      \
-        auto acl_call = [converted_params, workspace_addr, workspace_size, acl_stream, executor]()->int {            \
-            OpApiFunc opApiFunc = reinterpret_cast<OpApiFunc>(opApiFuncAddr);                                          \
-            auto api_ret = opApiFunc(workspace_addr, workspace_size, executor, acl_stream);                            \
-            ReleaseConvertTypes(converted_params);  // 释放转换后的类型                                                \
-            return api_ret;                                                                                            \
-        };                                                                                                             \
-        at_npu::native::OpCommand cmd;                                                                                 \
-        cmd.Name(#aclnn_api);                                                                                          \
-        cmd.SetCustomHandler(acl_call);                                                                                \
-        cmd.Run();                                                                                                     \
-    } while (false)
-```
+### 4.6 其他发现的昇腾特有接口
 
-#### 六、C++编译器特性（无需适配）
-
-| 特性 | 功能说明 | 支持状态 |
-|-----|---------|---------|
-| `if constexpr` | 编译期条件分支（C++17） | **完全支持** |
-| `static_assert` | 编译期断言 | **完全支持** |
-| `std::optional<T>` | 可选值类型（C++17） | **完全支持** |
-| `std::enable_if_t<B, T>` | SFINAE条件类型 | **完全支持** |
-| `std::tuple<T1, T2>` | 元组类型 | **完全支持** |
-
-### 4.3 Kernel启动方式对比
-
-```cpp
-// CUDA启动方式
-process_item_zch<...><<<gridSize, blockSize, 0, stream>>>(
-    input, output, identities, ...);
-
-// 昇腾SIMT启动方式
-AscendC::Simt::VF_CALL<ZeroCollisionHashSimt<...>>(
-    AscendC::Simt::Dim3{threadsPerBlock, 1, 1},
-    input, output, identities, ...);
-```
+| 接口 | 功能说明 | 使用位置 | 备注 |
+|-----|---------|---------|------|
+| `asc_atomic_add()` | UB（Unified Buffer）上的原子加，仅支持int32_t | RecSDK: `block_bucketize_sparse_features_kernel.h:571,719` | 用于本地缓冲区的原子计数，可替代部分atomicAdd场景 |
+| `SetAtomicMax<T>()` | 设置全局内存原子Max模式 | RecSDK: `backward_codegen_unweighted_exact_kernel.h:146` | 配合DataCopy使用，仅支持int8_t等有限类型 |
 
 ---
 
