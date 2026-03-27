@@ -2,7 +2,7 @@
 
 ## 一、迁移概述
 
-本文档详细描述了将FBGEMM的`zero_collision_hash`算子迁移到昇腾NPU平台的完整实现方案，包括目录结构设计、SIMT kernel实现、算子框架注册等。
+本文档详细描述了将FBGEMM的`zero_collision_hash`算子迁移到昇腾NPU平台的完整实现方案，参照**fbgemm-ascend**代码仓的架构和构建方式，包括目录结构设计、SIMT kernel实现、算子框架注册等。
 
 ### 1.1 算子功能说明
 
@@ -21,28 +21,234 @@
 | 并行模型 | CUDA Thread Block | SIMT VF_CALL |
 | 原子操作 | atomicCAS/atomicExch | AscendC::Simt::AtomicCas/Exch |
 
+### 1.3 芯片版本说明
+
+- **c310**：代表昇腾**A5 950PR芯片**，**仅A5代际芯片支持SIMT接口**，A2/A3芯片不支持
+- **SIMT接口适用范围**：仅A5代际（如c310）芯片可使用本方案中的SIMT实现
+- **A2/A3芯片**：如需支持，需要使用非SIMT接口（见第4.5节）
+
 ---
 
-## 二、目录结构设计
+## 二、适配到 fbgemm-ascend 仓库的目录结构
 
-参考RecSDK/cust_op的目录组织，迁移后的算子目录结构如下：
+### 2.1 fbgemm-ascend 仓库实际目录结构
+
+基于 fbgemm-ascend（https://gitcode.com/Ascend/fbgemm-ascend）仓库的实际代码，其目录结构如下：
 
 ```
-ascendc_op/ai_core_op/zero_collision_hash/
-├── c310/                                    # 芯片版本目录
-│   ├── zero_collision_hash.json             # 算子配置文件
-│   ├── op_host/                             # Host端代码
-│   │   ├── zero_collision_hash.cpp          # Tiling函数和算子注册
-│   │   └── zero_collision_hash_tiling.h     # Tiling数据结构定义
-│   ├── op_kernel/                           # Kernel端代码
-│   │   ├── zero_collision_hash.cpp          # Kernel入口
-│   │   ├── zero_collision_hash_kernel.h     # Kernel类定义
-│   │   └── simt_kernel.h                    # SIMT kernel实现
-│   ├── run.sh                               # 编译运行脚本
-│   └── README.md                            # 算子说明文档
-└── v220/                                    # 其他芯片版本（可选）
-    └── ...
+fbgemm-ascend/                                    # 项目根目录
+├── bench/                                        # 性能基准测试脚本（按算子类别组织）
+│   ├── sparse/                                   #   稀疏算子基准测试
+│   ├── jagged/                                   #   锯齿张量基准测试
+│   ├── pooled_embedding/                         #   池化嵌入基准测试
+│   ├── tbe_inference/                            #   TBE推理基准测试
+│   └── tbe_training/                             #   TBE训练基准测试
+├── fbgemm_ascend/                                # Python包入口
+│   ├── __init__.py                               #   环境探测、OPP路径自动设置
+│   └── env_setup.sh                              #   环境变量设置脚本
+├── include/                                      # C++/AscendC 公共头文件
+│   └── fbgemm_ascend/                            #   公共接口头文件
+├── src/                                          # 自定义算子实现、注册源码
+│   ├── cmake/                                    #   CMake模块（func.cmake等）
+│   ├── common/                                   #   公共工具（pytorch_npu_helper.hpp等）
+│   ├── common_ops/                               #   Kernel公共头文件
+│   │   ├── kernel_common_utils.h
+│   │   ├── ops_log.h
+│   │   └── workload_sharder.h
+│   ├── sparse_ops/                               #   稀疏算子（按算子名组织）
+│   │   ├── asynchronous_complete_cumsum/
+│   │   │   ├── asynchronous_complete_cumsum.cpp  #   C++适配层（注册到torch.ops）
+│   │   │   ├── c310/                            #     A5芯片 AscendC实现
+│   │   │   │   ├── asynchronous_complete_cumsum.json
+│   │   │   │   ├── op_host/                     #     Tiling + OpDef
+│   │   │   │   ├── op_kernel/                   #     SIMT Kernel
+│   │   │   │   ├── run.sh                       #     编译脚本
+│   │   │   │   └── README.md
+│   │   │   └── v220/                            #     A2/A3芯片实现
+│   │   ├── block_bucketize_sparse_features/      #   （结构同上）
+│   │   └── ...
+│   ├── jagged_tensor_ops/                        #   锯齿张量算子
+│   ├── pooled_embedding_ops/                     #   池化嵌入算子
+│   ├── intraining_embedding_pruning_ops/         #   训练中嵌入剪枝算子
+│   ├── tbe_inference/                            #   TBE推理算子
+│   └── tbe_training/                             #   TBE训练算子
+├── CMakeLists.txt                                # 顶层CMake（构建适配层.so）
+├── FbgemmAscend.cmake                            # AscendC算子编译入口
+├── setup.py                                      # Python包构建（scikit-build）
+├── build_whl.sh                                  # whl包构建脚本
+└── README.md
 ```
+
+**关键架构说明**：
+
+| 层次 | 说明 |
+|-----|------|
+| `src/<category>/<op_name>/<op_name>.cpp` | C++适配层，使用 `EXEC_NPU_CMD(aclnnXxx, ...)` 调用AscendC算子，并通过 `TORCH_LIBRARY_IMPL` 注册到 `torch.ops.fbgemm` |
+| `src/<category>/<op_name>/c310/` | A5芯片的AscendC实现，包含 `op_host/`（Tiling + OpDef）和 `op_kernel/`（SIMT Kernel） |
+| `src/<category>/<op_name>/v220/` | A2/A3芯片的AscendC实现（可选，不含SIMT） |
+| `FbgemmAscend.cmake` | 统一管理所有AscendC算子的编译注册，新增算子只需在此文件中添加条目 |
+| `src/common_ops/` | Kernel公共头文件（`kernel_common_utils.h`、`ops_log.h`等） |
+| `src/common/` | C++适配层公共工具（`pytorch_npu_helper.hpp`、`common_utils.h`） |
+
+### 2.2 单个算子的标准目录结构
+
+以 `asynchronous_complete_cumsum` 为例，展示一个典型算子的完整文件组织：
+
+```
+src/sparse_ops/asynchronous_complete_cumsum/
+├── asynchronous_complete_cumsum.cpp              # [适配层] C++注册 + EXEC_NPU_CMD调用
+├── c310/                                         # A5芯片实现
+│   ├── asynchronous_complete_cumsum.json         #   算子描述文件（输入/输出/属性）
+│   ├── op_host/
+│   │   ├── asynchronous_complete_cumsum_tiling.h #   Tiling数据结构定义
+│   │   └── asynchronous_complete_cumsum.cpp      #   TilingFunc + OpDef注册
+│   ├── op_kernel/
+│   │   ├── asynchronous_complete_cumsum_kernel.h #   Kernel类定义
+│   │   ├── asynchronous_complete_cumsum.cpp      #   Kernel入口
+│   │   └── simt_kernel.h                        #   SIMT Kernel实现（A5独有）
+│   ├── run.sh                                    #   编译脚本
+│   └── README.md
+└── v220/                                         # A2/A3芯片实现（可选）
+    ├── asynchronous_complete_cumsum.json
+    ├── op_host/
+    ├── op_kernel/
+    ├── run.sh
+    └── README.md
+```
+
+### 2.3 zero_collision_hash 适配后的目录结构
+
+`zero_collision_hash` 属于**稀疏算子（sparse_ops）**类别，适配后的目录结构：
+
+```
+src/sparse_ops/zero_collision_hash/
+├── zero_collision_hash.cpp                       # [适配层] C++注册 + EXEC_NPU_CMD调用
+├── c310/                                         # A5芯片实现（SIMT）
+│   ├── zero_collision_hash.json                  #   算子描述文件
+│   ├── op_host/
+│   │   ├── zero_collision_hash_tiling.h          #   Tiling数据结构定义
+│   │   └── zero_collision_hash.cpp               #   TilingFunc + OpDef注册
+│   ├── op_kernel/
+│   │   ├── zero_collision_hash_kernel.h          #   Kernel类定义
+│   │   ├── zero_collision_hash.cpp               #   Kernel入口
+│   │   └── simt_kernel.h                        #   SIMT Kernel实现
+│   ├── run.sh                                    #   编译脚本
+│   └── README.md
+└── v220/                                         # A2/A3芯片（可选，不含SIMT）
+    └── ...（如需支持A2/A3芯片）
+```
+
+### 2.4 迁移集成步骤
+
+**步骤一：在仓库中创建算子目录**
+
+```bash
+cd /path/to/fbgemm-ascend
+mkdir -p src/sparse_ops/zero_collision_hash/c310
+```
+
+**步骤二：复制AscendC实现文件**
+
+将本地 `zero_collision_hash_ascendc/c310/` 下的文件复制到 `src/sparse_ops/zero_collision_hash/c310/`：
+
+```bash
+cp zero_collision_hash_ascendc/c310/zero_collision_hash.json  src/sparse_ops/zero_collision_hash/c310/
+cp -r zero_collision_hash_ascendc/c310/op_host                    src/sparse_ops/zero_collision_hash/c310/
+cp -r zero_collision_hash_ascendc/c310/op_kernel                  src/sparse_ops/zero_collision_hash/c310/
+cp zero_collision_hash_ascendc/c310/run.sh                        src/sparse_ops/zero_collision_hash/c310/
+```
+
+**步骤三：编写C++适配层**
+
+创建 `src/sparse_ops/zero_collision_hash/zero_collision_hash.cpp`，参照仓库中其他算子的模式：
+
+```cpp
+// zero_collision_hash.cpp - C++适配层
+#include <torch/library.h>
+#include "../../common/pytorch_npu_helper.hpp"
+#include "../../common/common_utils.h"
+
+// NPU实现函数，通过EXEC_NPU_CMD调用AscendC算子
+std::tuple<at::Tensor, at::Tensor> zero_collision_hash_npu(
+    const at::Tensor& input,
+    const at::Tensor& identities,
+    ...
+    int64_t max_probe) {
+    // ... 参数检查和输出张量分配 ...
+    EXEC_NPU_CMD(aclnnZeroCollisionHash, input, identities, output, evict_slots, ...);
+    return std::make_tuple(output, evict_slots);
+}
+
+// 注册到torch.ops.fbgemm
+TORCH_LIBRARY_FRAGMENT(fbgemm, m) {
+    m.def("zero_collision_hash(...)");
+}
+TORCH_LIBRARY_IMPL(fbgemm, PrivateUse1, m) {
+    m.impl("zero_collision_hash", &zero_collision_hash_npu);
+}
+```
+
+**步骤四：在 FbgemmAscend.cmake 中注册算子**
+
+在 `FbgemmAscend.cmake` 的 `_ASCENDC_OPS` 列表中添加：
+
+```cmake
+list(APPEND _ASCENDC_OPS
+    "zero_collision_hash|${FBGEMM_ASCEND_SOURCE_DIR}/src/sparse_ops/zero_collision_hash"
+)
+```
+
+同时在 `FBGEMM_ASCEND_ADAPTER_SRCS` 中添加适配层源文件：
+
+```cmake
+list(APPEND FBGEMM_ASCEND_ADAPTER_SRCS
+    src/sparse_ops/zero_collision_hash/zero_collision_hash.cpp
+)
+```
+
+**步骤五：根据芯片支持策略更新编译配置**
+
+根据 zero_collision_hash 仅支持A5（SIMT），在 `FbgemmAscend.cmake` 的 `ASCENDC_A5_ONLY_OPS` 列表中添加：
+
+```cmake
+list(APPEND ASCENDC_A5_ONLY_OPS
+    zero_collision_hash
+)
+```
+
+**步骤六：调整 run.sh 中的路径引用**
+
+`run.sh` 中需要复制 `kernel_common_utils.h` 等公共头文件。参考现有算子的 run.sh 模式：
+
+```bash
+# 本仓库中 kernel_common_utils.h 在 src/common_ops/（c310 上四级到 src）
+cp -rf ../../../common_ops/kernel_common_utils.h <build_dir>/op_kernel/
+```
+
+**步骤七：编译验证**
+
+```bash
+cd /path/to/fbgemm-ascend
+bash build_whl.sh   # 构建完整的whl包
+# 或单独编译算子：
+cd src/sparse_ops/zero_collision_hash/c310
+bash run.sh ai_core-Ascend950
+```
+
+### 2.5 芯片版本对应关系
+
+| 芯片代际 | 目录名 | AI Core标识 | SIMT支持 | 说明 |
+|---------|-------|------------|---------|------|
+| **A5** | `c310` | `ai_core-Ascend950` | ✅ 支持 | 本方案主推 |
+| **A2** | `v220` | `ai_core-Ascend910B2` | ❌ 不支持 | 需非SIMT实现 |
+| **A3** | `v220` | `ai_core-Ascend910_93` | ❌ 不支持 | 需非SIMT实现 |
+
+> 注意：`FbgemmAscend.cmake` 中 `_fbgemm_get_target_info()` 函数根据芯片变体自动映射到正确的目录和AI Core标识。
+
+### 2.6 参考项目
+
+- **fbgemm-ascend**: https://gitcode.com/Ascend/fbgemm-ascend（目标仓库）
+- **HierarchicalKV-ascend**: https://gitcode.com/Ascend/HierarchicalKV-ascend（SIMT实现参考）
 
 ---
 
@@ -184,6 +390,8 @@ REGISTER_TILING_DATA_CLASS(ZeroCollisionHash, ZeroCollisionHashTilingData)
 
 ### 3.3 Host端实现 (op_host/zero_collision_hash.cpp)
 
+参考**fbgemm-ascend**代码仓中算子的Host实现模式，主要包含Tiling计算函数和算子注册类。
+
 ```cpp
 /*
  * Copyright (c) Huawei Technologies Co., Ltd. 2025-2026. All rights reserved.
@@ -222,25 +430,25 @@ static ge::graphStatus TilingFunc(gert::TilingContext* context)
     OPS_LOG_E_IF_NULL("inputShape", context->GetInputShape(0), return ge::GRAPH_FAILED);
     OPS_LOG_E_IF_NULL("inputTensor", context->GetInputTensor(0), return ge::GRAPH_FAILED);
     OPS_LOG_E_IF_NULL("identitiesShape", context->GetInputShape(1), return ge::GRAPH_FAILED);
-    
+
     // 获取输入维度
     int64_t inputLength = context->GetInputShape(0)->GetOriginShape().GetShapeSize();
     auto inputTensor = context->GetInputTensor(0);
     ge::DataType inputDataType = inputTensor->GetDataType();
-    
+
     // 获取identities维度
     int64_t modulo = context->GetInputShape(1)->GetOriginShape().GetDim(0);
-    
+
     uint32_t dimNum = context->GetInputShape(0)->GetOriginShape().GetDimNum();
     OPS_LOG_E_IF(dimNum != 1, context, return ge::GRAPH_FAILED,
                  "[ERROR]ZeroCollisionHash required the dim of input-0 is 1");
-    
+
     OPS_CHECK(inputDataType != ge::DT_INT32 && inputDataType != ge::DT_INT64,
               OPS_LOG_E("[ERROR]Invalid data type",
                         "ZeroCollisionHash only support int64 and int32."),
               return ge::GRAPH_FAILED);
-    
-    // 获取属性参数
+
+    // 获取属性参数（参考fbgemm-ascend中算子的属性读取方式）
     auto attrs = context->GetAttrs();
     int64_t maxProbe = attrs->GetAttrValue<int64_t>(0);      // max_probe
     bool circularProbe = attrs->GetAttrValue<bool>(1);       // circular_probe
@@ -248,32 +456,32 @@ static ge::graphStatus TilingFunc(gert::TilingContext* context)
     int32_t hashIdentity = attrs->GetAttrValue<int>(3);      // hash_identity
     int64_t optInProb = attrs->GetAttrValue<int64_t>(4);     // opt_in_prob
     int64_t numReservedSlots = attrs->GetAttrValue<int64_t>(5); // num_reserved_slots
-    
+
     // 检查可选输入
     bool hasLocalSizes = (context->GetInputShape(2) != nullptr);
     bool hasOffsets = (context->GetInputShape(3) != nullptr);
-    
-    // 计算分块参数
+
+    // 计算分块参数（参考HierarchicalKV-ascend的tiling实现）
     auto ascendPlatform = platform_ascendc::PlatformAscendC(context->GetPlatformInfo());
     size_t maxCores = ascendPlatform.GetCoreNumAiv();
-    
+
     int32_t elementsPerBlock = MAX_THREADS_PER_BLOCK * MAX_ELEMENTS_PER_THREAD;
     int64_t totalBlocks = (inputLength + elementsPerBlock - 1) / elementsPerBlock;
-    
+
     size_t coreNum = (totalBlocks < maxCores) ? totalBlocks : maxCores;
     if (coreNum == 0) {
         coreNum = 1;
     }
-    
+
     int64_t blocksPerCore = totalBlocks / coreNum;
     int32_t remainderBlocks = totalBlocks % coreNum;
-    
+
     // 设置workspace大小
     size_t* workspaceSize = context->GetWorkspaceSizes(1);
     OPS_LOG_E_IF_NULL("workspaceSize", workspaceSize, return ge::GRAPH_FAILED);
     size_t systemWorkspacesSize = ascendPlatform.GetLibApiWorkSpaceSize();
     workspaceSize[0] = systemWorkspacesSize;
-    
+
     // 填充tiling数据
     ZeroCollisionHashTilingData tiling;
     tiling.set_inputLength(inputLength);
@@ -290,15 +498,15 @@ static ge::graphStatus TilingFunc(gert::TilingContext* context)
     tiling.set_hasOffsets(hasOffsets);
     tiling.set_optInProb(optInProb);
     tiling.set_numReservedSlots(numReservedSlots);
-    
+
     context->SetBlockDim(coreNum);
     context->SetLocalMemorySize(DCACHE_SIZE);
-    
+
     OPS_LOG_E_IF_NULL("raw tilingData", context->GetRawTilingData(), return ge::GRAPH_FAILED);
-    tiling.SaveToBuffer(context->GetRawTilingData()->GetData(), 
+    tiling.SaveToBuffer(context->GetRawTilingData()->GetData(),
                         context->GetRawTilingData()->GetCapacity());
     context->GetRawTilingData()->SetDataSize(tiling.GetDataSize());
-    
+
     return ge::GRAPH_SUCCESS;
 }
 
@@ -309,21 +517,21 @@ namespace ge {
 static ge::graphStatus InferShape(gert::InferShapeContext* context)
 {
     OPS_LOG_E_IF_NULL("context", context, return ge::GRAPH_FAILED);
-    
+
     const gert::Shape* inputShape = context->GetInputShape(0);
     OPS_LOG_E_IF_NULL("inputShape", inputShape, return ge::GRAPH_FAILED);
-    
+
     // 输出output与输入input形状相同
     gert::Shape* outputShape = context->GetOutputShape(0);
     OPS_LOG_E_IF_NULL("outputShape", outputShape, return ge::GRAPH_FAILED);
     *outputShape = *inputShape;
-    
-    // evict_slots输出为空或与输入相同大小
+
+    // evict_slots输出为空或与输入相同大小（推理模式下为空）
     gert::Shape* evictShape = context->GetOutputShape(1);
     OPS_LOG_E_IF_NULL("evictShape", evictShape, return ge::GRAPH_FAILED);
     evictShape->SetDimNum(1);
-    evictShape->SetDim(0, 0);  // 推理模式下为空
-    
+    evictShape->SetDim(0, 0);
+
     return GRAPH_SUCCESS;
 }
 
@@ -352,46 +560,46 @@ public:
             .DataType({ge::DT_INT64, ge::DT_INT32})
             .FormatList({ge::FORMAT_ND})
             .UnknownShapeFormat({ge::FORMAT_ND, ge::FORMAT_ND});
-            
+
         this->Input("identities")
             .ParamType(REQUIRED)
             .DataType({ge::DT_INT64, ge::DT_INT32})
             .FormatList({ge::FORMAT_ND})
             .UnknownShapeFormat({ge::FORMAT_ND, ge::FORMAT_ND});
-            
+
         this->Input("local_sizes")
             .ParamType(OPTIONAL)
             .DataType({ge::DT_INT64})
             .FormatList({ge::FORMAT_ND});
-            
+
         this->Input("offsets")
             .ParamType(OPTIONAL)
             .DataType({ge::DT_INT64})
             .FormatList({ge::FORMAT_ND});
-            
+
         this->Output("output")
             .ParamType(REQUIRED)
             .DataType({ge::DT_INT64, ge::DT_INT32})
             .FormatList({ge::FORMAT_ND})
             .UnknownShapeFormat({ge::FORMAT_ND, ge::FORMAT_ND});
-            
+
         this->Output("evict_slots")
             .ParamType(REQUIRED)
             .DataType({ge::DT_INT64, ge::DT_INT32})
             .FormatList({ge::FORMAT_ND})
             .UnknownShapeFormat({ge::FORMAT_ND, ge::FORMAT_ND});
-        
-        // 算子属性
+
+        // 算子属性（与FBGEMM原始参数保持一致）
         this->Attr("max_probe", ge::AttrType::ATTR_INT, "128");
         this->Attr("circular_probe", ge::AttrType::ATTR_BOOL, "false");
         this->Attr("disable_fallback", ge::AttrType::ATTR_BOOL, "false");
         this->Attr("hash_identity", ge::AttrType::ATTR_INT, "1");
         this->Attr("opt_in_prob", ge::AttrType::ATTR_INT, "-1");
         this->Attr("num_reserved_slots", ge::AttrType::ATTR_INT, "-1");
-        
+
         this->SetInferShape(ge::InferShape).SetInferDataType(ge::InferDataType);
         this->AICore().SetTiling(optiling::TilingFunc);
-        this->AICore().AddConfig("ascend950");
+        this->AICore().AddConfig("ascend950");  // 对应A5芯片
     }
 };
 
@@ -1017,7 +1225,7 @@ extern "C" __global__ __aicore__ void zero_collision_hash(GM_ADDR input, GM_ADDR
 
 ## 四、SIMT接口映射关系
 
-本节基于 **RecSDK/cust_op** 和 **HierarchicalKV-ascend** 两个项目的实际代码，分析 `zero_collision_hash` 算子迁移所需的所有接口映射关系。
+本节基于 **fbgemm-ascend**、**RecSDK/cust_op** 和 **HierarchicalKV-ascend** 的实际代码，分析 `zero_collision_hash` 算子迁移所需的所有接口映射关系。
 
 ### 4.1 接口映射总览
 
@@ -1187,33 +1395,17 @@ TORCH_LIBRARY_FRAGMENT(fbgemm, m) {
 
 ---
 
-## 五、编译与部署
+## 五、编译构建与测试验证
 
-### 5.1 编译脚本 (run.sh)
+### 5.1 构建系统说明
 
-```bash
-#!/bin/bash
+fbgemm-ascend 仓库采用统一的构建系统：
 
-# 设置环境变量
-export ASCEND_HOME=/usr/local/Ascend
-export ASCEND_TOOLKIT_HOME=${ASCEND_HOME}/ascend-toolkit/latest
-export ASCEND_AICPU_PATH=${ASCEND_TOOLKIT_HOME}
+- **AscendC算子编译**：通过 `FbgemmAscend.cmake` 统一管理，使用 `msopgen` 生成代码 + `run.sh` 编译
+- **C++适配层编译**：通过顶层 `CMakeLists.txt` 编译为 `.so` 库
+- **Python包构建**：通过 `setup.py`（scikit-build）生成 `whl` 包
 
-# 编译参数
-OP_NAME=zero_collision_hash
-CHIP=c310
-
-# 编译算子
-bash build.sh ${OP_NAME} ${CHIP}
-
-# 验证编译结果
-if [ -f "build/lib/lib${OP_NAME}.so" ]; then
-    echo "Build success: lib${OP_NAME}.so"
-else
-    echo "Build failed!"
-    exit 1
-fi
-```
+整体流程见上方第 2.4 节"迁移集成步骤"。
 
 ### 5.2 CMakeLists.txt 示例
 
@@ -1271,47 +1463,90 @@ target_link_libraries(zero_collision_hash
 
 ## 七、测试验证
 
-### 7.1 单元测试用例
+### 7.1 测试策略
+
+根据迁移指引，**zero_collision_hash的测试用例必须复用FBGEMM/fbgemm_gpu/test测试目录对应的测试用例**。测试用例通过后，认定迁移成功。
+
+**参考位置**：
+- **FBGEMM_GPU测试目录**: `FBGEMM/fbgemm_gpu/test/quantize_ops/` 或相关测试模块
+- **原GPU算子测试**: 参考`test_zero_collision_hash*.py`（如果存在）或类似hash算子的测试
+
+**测试流程**：
+1. 将原GPU版本的测试用例适配到昇腾NPU环境
+2. 修改设备为`npu`，并确保算子调用路径指向昇腾版本
+3. 运行测试用例，验证功能正确性
+4. 对比GPU版本输出，确保结果一致（在允许的误差范围内）
+
+### 7.2 适配现有测试用例
+
+在原FBGEMM_GPU测试代码基础上，主要修改点：
 
 ```python
 import torch
 import torch_npu  # 昇腾PyTorch扩展
 
-def test_zero_collision_hash_basic():
-    """基础功能测试"""
+# 原始GPU测试（FBGEMM/fbgemm_gpu/test/...）
+# 修改为昇腾版本：
+# 1. device='cuda' → device='npu'
+# 2. torch.ops.fbgemm_gpu.xxx → torch.ops.fbgemm.xxx（若算子注册名一致）
+# 3. 如有CUDA特有操作，需要替换为NPU等效操作
+
+def test_zero_collision_hash_basic_npu():
+    """基础功能测试 - 适配昇腾"""
     input_ids = torch.tensor([1, 2, 3, 4, 5], dtype=torch.int64, device='npu')
     identities = torch.full((1000, 1), -1, dtype=torch.int64, device='npu')
-    
-    # 调用算子
+
+    # 调用昇腾算子
     output, evict_slots = torch.ops.fbgemm.zero_collision_hash(
         input_ids, identities, max_probe=128, readonly=True
     )
-    
+
     print(f"Output: {output}")
     print(f"Evict slots: {evict_slots}")
     assert output.shape == input_ids.shape
-    print("Basic test passed!")
+    print("Basic NPU test passed!")
 
-def test_zero_collision_hash_collision():
-    """冲突处理测试"""
-    # 创建可能冲突的输入
+def test_zero_collision_hash_collision_npu():
+    """冲突处理测试 - 适配昇腾"""
     input_ids = torch.tensor([1, 1001, 2001, 3001], dtype=torch.int64, device='npu')
     identities = torch.full((500, 1), -1, dtype=torch.int64, device='npu')
-    
+
     output, _ = torch.ops.fbgemm.zero_collision_hash(
         input_ids, identities, max_probe=128, readonly=True
     )
-    
+
     # 验证输出索引不重复
     unique_outputs = torch.unique(output)
     assert len(unique_outputs) == len(output), "Collision not handled properly"
-    print("Collision test passed!")
+    print("Collision NPU test passed!")
 
 if __name__ == "__main__":
-    test_zero_collision_hash_basic()
-    test_zero_collision_hash_collision()
-    print("All tests passed!")
+    test_zero_collision_hash_basic_npu()
+    test_zero_collision_hash_collision_npu()
+    print("All NPU tests passed!")
 ```
+
+### 7.3 运行测试
+
+```bash
+# 进入fbgemm_gpu测试目录
+cd FBGEMM/fbgemm_gpu/test
+
+# 运行pytest（适配昇腾环境）
+pytest test_quantize_ops/test_zero_collision_hash.py -v  # 如果存在独立测试文件
+# 或
+pytest test/ -k zero_collision_hash -v
+
+# 单个测试文件
+python test_zero_collision_hash.py
+```
+
+**验收标准**：
+- 所有FBGEMM_GPU中原有的zero_collision_hash测试用例在昇腾NPU上通过
+- 功能结果与GPU版本一致（考虑数据类型和精度差异）
+- 无崩溃、数据越界等严重问题
+
+---
 
 ### 7.2 性能基准测试
 
@@ -1350,7 +1585,82 @@ if __name__ == "__main__":
 
 ---
 
-## 八、关键实现要点
+## 八、非SIMT接口（A2/A3芯片适配）
+
+### 8.2 非SIMT API开发要点| 芯片代际 | 芯片型号 | SIMT支持 | 推荐实现方式 |
+|---------|---------|---------|-------------|
+| **A5代际** | c310 (950PR) | ✅ 支持 | 本方案主推的SIMT实现 |
+| **A2代际** | c200 (310P) | ❌ 不支持 | 使用非SIMT接口（Stream/Vector融合） |
+| **A3代际** | c250 (510) | ❌ 不支持 | 使用非SIMT接口（Stream/Vector融合） |
+
+### 8.2 非SIMT API开发要点
+
+对于A2/A3芯片，需要使用传统的**Stream（流多线程）+ Vector（向量化）**编程模型，而非SIMT（单指令多线程）模型。
+
+**核心接口差异**：
+
+| 功能 | SIMT (A5) | 非SIMT (A2/A3) |
+|-----|-----------|---------------|
+| 线程模型 | CUDA-like SIMT | Stream + Vector |
+| 线程同步 | `AscendC::Simt::ThreadBarrier()` | `AscendC::PipeBarrier()` |
+| 原子操作 | `AscendC::Simt::AtomicCas()` | `AscendC::AtomicAdd()` 等 |
+| Kernel启动 | `Simt::VF_CALL<Kernel>()` | `Kernel::template Process()` |
+| 线程索引 | `GetThreadIdx<0>()` | `GetBlockIdx()` + `GetThreadIdx()` |
+
+**非SIMT编程模式**（参考文档）：
+```cpp
+// A2/A3非SIMT核函数结构
+__aicore__ inline void ZeroCollisionHashKernel() {
+    // 1. 获取线程/Stream索引
+    int32_t blockIdx = GetBlockIdx();
+    int32_t threadIdx = GetThreadIdx();
+
+    // 2. 使用Pipe进行数据搬运（GM->UB, UB->GM）
+    // ...
+
+    // 3. 使用Vector指令进行并行计算
+    // ...
+
+    // 4. 使用PipeBarrier进行同步
+    PipeBarrier(PIPE_MTE3);
+}
+
+// Host端启动（非SIMT）
+extern "C" __global__ __aicore__ void zero_collision_hash(...) {
+    // 初始化参数
+    KernelArgs args = { ... };
+
+    // 启动Stream内核
+    ZeroCollisionHashKernel args;
+}
+```
+
+### 8.3 非SIMT开发文档
+
+详细开发指南请参考昇腾官方文档：
+
+1. **AscendC算子开发（通用 - A2/A3）**
+   - 文档地址: https://www.hiascend.com/document/detail/zh/CANNCommunityEdition/900beta1/opdevg/Ascendcopdevg/atlas_ascendc_map_10_0002.html
+   - 内容：A2/A3芯片的非SIMT算子开发全流程，包括数据搬运、计算核、内存管理等
+
+2. **AscendC API参考（非SIMT）**
+   - 文档地址: https://www.hiascend.com/document/detail/zh/CANNCommunityEdition/900beta1/API/ascendcopapi/atlasascendc_api_07_0003.html
+   - 内容：非SIMT接口的详细API说明，包括Pipe、DataCopy、Vector指令等
+
+### 8.4 A2/A3适配建议
+
+如果需要在A2/A3芯片上支持zero_collision_hash：
+
+1. **重新实现kernel**：基于非SIMT编程模型重写`simt_kernel.h`中的计算核心
+2. **数据搬运优化**：使用`Pipe/DataCopy`高效搬运数据到UB（Unified Buffer）
+3. **向量化计算**：将探测逻辑向量化，每个Vector处理多个元素
+4. **原子操作适配**：使用`AtomicAdd/AtomicCas`等非SIMT原子接口（注意A2/A3的原子操作支持能力可能不同）
+
+鉴于A5芯片（c310）已经支持SIMT，**推荐优先在A5平台上部署**，A2/A3平台暂时不支持。
+
+---
+
+## 九、关键实现要点
 
 ### 8.1 MurmurHash3哈希函数移植
 
@@ -1476,15 +1786,73 @@ for (int32_t offset = GROUP_SIZE / 2; offset > 0; offset /= 2) {
 
 ---
 
-## 九、总结
+## 十、总结
 
-本文档详细描述了将FBGEMM的`zero_collision_hash`算子迁移到昇腾NPU平台的完整方案：
+本文档详细描述了将FBGEMM的`zero_collision_hash`算子迁移到昇腾NPU平台的完整方案，参照**fbgemm-ascend**代码仓的架构和构建方式：
 
-1. **目录结构**：遵循RecSDK/cust_op的标准结构，支持多芯片版本
-2. **SIMT实现**：使用`__simt_vf__`声明和`VF_CALL`启动kernel
+1. **目录结构**：遵循**fbgemm-ascend**的标准结构（c310目录用于A5芯片）
+2. **SIMT实现**：使用`__simt_vf__`声明和`VF_CALL`启动kernel（适用于c310/A5）
 3. **原子操作**：使用`AscendC::Simt::AtomicCas`等接口实现并发控制
 4. **框架注册**：通过OpDef类完成算子注册和形状推导
-5. **类型泛化**：支持int32/int64的模板实例化
-6. **探测模式**：支持循环/非循环探测的编译期模板选择
+5. **测试策略**：复用`FBGEMM/fbgemm_gpu/test`中的测试用例
+6. **芯片适配**：c310（A5 950PR）为SIMT实现；如需支持A2/A3，需使用非SIMT接口
 
-迁移后的算子能够充分利用昇腾NPU的SIMT并行能力，保持与原始CUDA版本相同的功能语义。
+**关键参考项目**：
+- **fbgemm-ascend**: https://gitcode.com/Ascend/fbgemm-ascend（参考架构和构建方式）
+- **HierarchicalKV-ascend**: https://gitcode.com/Ascend/HierarchicalKV-ascend（参考SIMT实现细节）
+- **A2/A3非SIMT文档**: 官方AscendC开发文档（见第8.3节）
+
+迁移后的算子能够充分利用昇腾NPU的SIMT并行能力，保持与原始CUDA版本相同的功能语义。通过复用FBGEMM_GPU的测试用例进行验证，确保功能正确性。
+
+---
+
+## 附录
+
+### 附录A：CMake Presets 配置示例
+
+在 `fbgemm-ascend/c310/` 目录下可以使用 `CMakePresets.json` 简化构建：
+
+```json
+{
+  "version": 1,
+  "configurePresets": [
+    {
+      "name": "c310-default",
+      "generator": "Unix Makefiles",
+      "cacheVariables": {
+        "CMAKE_CXX_COMPILER": "/usr/local/Ascend/ascend-toolkit/latest/bin/ccec",
+        "CMAKE_C_COMPILER": "/usr/local/Ascend/ascend-toolkit/latest/bin/ccec",
+        "CMAKE_BUILD_TYPE": "Release"
+      }
+    }
+  ]
+}
+```
+
+---
+
+## 参考文献
+
+### 项目仓库
+- **fbgemm-ascend**: https://gitcode.com/Ascend/fbgemm-ascend
+  - **目标仓库**，zero_collision_hash 算子最终适配的位置
+  - 标准架构：`c310/ai_core_op/<op_name>/`
+
+- **HierarchicalKV-ascend**: https://gitcode.com/Ascend/HierarchicalKV-ascend
+  - SIMT kernel实现的详细样例
+  - 包含原子操作、warp操作等高级特性
+
+- **RecSDK/cust_op**: 昇腾自定义算子开发SDK
+  - 提供算子开发的通用模式和最佳实践
+
+### 官方文档
+- **AscendC算子开发（A2/A3非SIMT）**: https://www.hiascend.com/document/detail/zh/CANNCommunityEdition/900beta1/opdevg/Ascendcopdevg/atlas_ascendc_map_10_0002.html
+  - A2/A3芯片的非SIMT算子开发指南
+
+- **AscendC API参考**: https://www.hiascend.com/document/detail/zh/CANNCommunityEdition/900beta1/API/ascendcopapi/atlasascendc_api_07_0003.html
+  - 非SIMT接口的详细API说明
+
+### 测试用例
+- **FBGEMM_GPU测试目录**: `FBGEMM/fbgemm_gpu/test/`
+  - 迁移测试用例的来源位置
+  - 包含zero_collision_hash相关的功能测试
