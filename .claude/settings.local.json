@@ -1,0 +1,27 @@
+{
+  "permissions": {
+    "allow": [
+      "WebSearch",
+      "Bash(git clone:*)",
+      "Bash(tree:*)",
+      "Bash(grep:*)",
+      "Bash(ls:*)",
+      "Bash(wc:*)",
+      "Bash(find:*)",
+      "Bash(npx skills add nextlevelbuilder/ui-ux-pro-max-skill@ckm:slides -g -y)",
+      "WebFetch(domain:skills.sh)",
+      "Bash(npx skills find \"slides\")",
+      "Bash(git ls-remote https://github.com/nextlevelbuilder/ui-ux-pro-max-skill.git 2>&1 | head -20)",
+      "Bash(git ls-remote https://github.com/nextlevelbuilder/ui-ux-pro-max-skill.git 2>&1 | grep -i \"ckm\")",
+      "Bash(curl -sL \"https://raw.githubusercontent.com/nextlevelbuilder/ui-ux-pro-max-skill/main/package.json\" 2>&1 | head -50)",
+      "Bash(curl -sL \"https://raw.githubusercontent.com/nextlevelbuilder/ui-ux-pro-max-skill/feat/banner-and-slides/README.md\" 2>&1 | head -100)",
+      "Bash(curl -sL \"https://www.npmjs.com/package/uipro-cli\" 2>&1 | grep -i \"installation\\\\|install\" | head -10)",
+      "Bash(npm install -g uipro-cli 2>&1)",
+      "Bash(uipro --help 2>&1)",
+      "Bash(uipro init --help 2>&1)",
+      "WebFetch(domain:github.com)",
+      "Bash(curl -sL \"https://raw.githubusercontent.com/nextlevelbuilder/ui-ux-pro-max-skill/main/.claude/skills/slides/SKILL.md\" 2>&1 | head -100)",
+      "Bash(cp -R ~/.agents/skills/* ~/.openclaw/skills/ 2>&1)"
+    ]
+  }
+}
