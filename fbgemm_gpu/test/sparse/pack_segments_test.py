@@ -10,7 +10,6 @@
 # pyre-ignore-all-errors[56]
 
 import unittest
-from typing import Optional
 
 import hypothesis.strategies as st
 import numpy as np
@@ -48,7 +47,7 @@ class PackedSegmentsTest(unittest.TestCase):
         self,
         lengths: torch.Tensor,
         tensor: torch.Tensor,
-        max_length: Optional[int] = None,
+        max_length: int | None = None,
     ) -> npt.NDArray:
         """
         This function is a reference implementation of pack_segments.
@@ -56,7 +55,7 @@ class PackedSegmentsTest(unittest.TestCase):
         Args:
             lengths (Tensor): The lengths of tensor.
             tensor (Tensor): The tensor to be packed.
-            max_length (Optional[int]): The maximum length of the packed tensor.
+            max_length (int | None): The maximum length of the packed tensor.
 
         Returns:
             The packed tensor.
@@ -399,7 +398,7 @@ class PackedSegmentsTest(unittest.TestCase):
             return_presence_mask=True,
         )
 
-        # pyre-fixme[6]: In call `tuple.__new__`, for 1st positional argument, expected `Iterable[int]` but got `Iterable[Union[bool, float, int]]`.
+        # pyre-fixme[6]: In call `tuple.__new__`, for 1st positional argument, expected `Iterable[int]` but got `Iterable[bool | float | int]`.
         assert presence_mask.size() == torch.Size([lengths.numel(), max_length])
 
     @unittest.skipIf(*gpu_unavailable)
@@ -552,6 +551,77 @@ class PackedSegmentsTest(unittest.TestCase):
             torch.equal(input_data_v2.grad.cpu(), input_data_ref_v2.grad.cpu()),
             msg="Expected input gradients to be equal but they are not",
         )
+
+    @unittest.skipIf(*gpu_unavailable)
+    @given(
+        dtype=st.sampled_from(
+            [
+                torch.float,
+                torch.half,
+                torch.bfloat16,
+            ]
+        ),
+    )
+    @settings(deadline=None)
+    def test_pack_segments_backward_truncated(self, dtype: torch.dtype) -> None:
+        """
+        Regression test: when lengths[seq] > max_length, the backward kernel
+        previously left positions [cumsum[seq]+max_length, cumsum[seq]+lengths[seq])
+        in the input gradient as uninitialized memory (allocated via at::empty).
+
+        After the fix (at::empty -> at::zeros), those positions must be exactly 0
+        because they correspond to events that were truncated by the forward pass
+        and so cannot influence the loss.
+
+        Without the fix, these positions contain garbage, which propagates upstream
+        and can cause NaN cascades in deep networks (LayerNorm backward amplification).
+        """
+        # Choose lengths intentionally larger than max_length for some segments
+        max_length = 4
+        lengths_cpu = torch.tensor([10, 5, 8, 2], dtype=torch.int)
+        total_length = int(lengths_cpu.sum().item())
+        cell_size = 8
+
+        # Run multiple trials to detect uninitialized memory:
+        # if positions are uninit, values change across trials.
+        observed_grads = []
+        for _ in range(5):
+            input_data = (
+                torch.randn(total_length, cell_size, dtype=dtype)
+                .cuda()  # noqa: CITRINE(redundant_cuda_to_device)
+                .requires_grad_(True)
+            )
+            lengths = lengths_cpu.cuda()
+
+            packed = torch.ops.fbgemm.pack_segments(
+                t_in=input_data, lengths=lengths, max_length=max_length
+            )
+            grad_out = torch.ones_like(packed)
+            packed.backward(grad_out)
+
+            # pyre-ignore[16]
+            observed_grads.append(input_data.grad.detach().cpu().clone())
+
+        # Verify: positions where cell < min(lengths[seq], max_length) get grad=1
+        # positions where cell >= max_length but cell < lengths[seq] get grad=0
+        cumsum = 0
+        for seq, L in enumerate(lengths_cpu.tolist()):
+            for cell in range(L):
+                row = cumsum + cell
+                expected = 1.0 if cell < max_length else 0.0
+                for trial, grad in enumerate(observed_grads):
+                    actual = grad[row].abs().max().item()
+                    self.assertAlmostEqual(
+                        actual,
+                        expected,
+                        places=2,
+                        msg=(
+                            f"trial={trial} seq={seq} cell={cell} row={row}: "
+                            f"expected grad abs.max={expected}, got {actual}. "
+                            "Truncated rows must receive zero gradient (not uninit memory)."
+                        ),
+                    )
+            cumsum += L
 
 
 extend_test_class(PackedSegmentsTest)

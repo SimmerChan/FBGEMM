@@ -13,7 +13,7 @@ import string
 import tempfile
 import unittest
 from pathlib import Path
-from typing import BinaryIO, Optional, Union
+from typing import BinaryIO
 
 import fbgemm_gpu
 import torch
@@ -27,8 +27,8 @@ class FileStoreTest(unittest.TestCase):
         self,
         # pyre-fixme[2]
         store,  # FileStore
-        input: Union[BinaryIO, torch.Tensor, Path],
-        path: Optional[str] = None,
+        input: BinaryIO | torch.Tensor | Path,
+        path: str | None = None,
     ) -> None:
         """
         Generic FileStore routines to test reading and writing data
@@ -46,7 +46,9 @@ class FileStoreTest(unittest.TestCase):
         assert store.exists(path), f"{path} does not exist"
 
         if isinstance(input, torch.Tensor):
-            assert torch.load(store.read(path)).equal(input), "tensors do not match"
+            assert torch.load(store.read(path), weights_only=True).equal(
+                input
+            ), "tensors do not match"
 
         elif isinstance(input, io.BytesIO) or isinstance(input, BinaryIO):
             input.seek(0)
@@ -64,7 +66,7 @@ class FileStoreTest(unittest.TestCase):
         self,
         # pyre-fixme[2]
         store,  # FileStore
-        root_dir: Optional[str] = None,
+        root_dir: str | None = None,
     ) -> None:
         """
         Generic FileStore routines to test creating and removing directories

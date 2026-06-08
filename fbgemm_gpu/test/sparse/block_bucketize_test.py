@@ -11,7 +11,6 @@
 
 import random
 import unittest
-from typing import Optional
 
 import hypothesis.strategies as st
 import torch
@@ -1186,9 +1185,11 @@ class BlockBucketizeTest(unittest.TestCase):
             torch.testing.assert_close(
                 new_lengths_gpu.cpu(), new_lengths_ref, rtol=0, atol=0
             )
-            torch.testing.assert_allclose(
+            torch.testing.assert_close(
                 bucket_mapping_gpu.cpu(),
                 bucket_mapping,
+                rtol=0,
+                atol=0,
             )
 
     @given(
@@ -1289,9 +1290,11 @@ class BlockBucketizeTest(unittest.TestCase):
             torch.testing.assert_close(
                 new_lengths_gpu.cpu(), new_lengths_ref, rtol=0, atol=0
             )
-            torch.testing.assert_allclose(
+            torch.testing.assert_close(
                 bucket_mapping_gpu.cpu(),
                 bucket_mapping_cpu,
+                rtol=0,
+                atol=0,
             )
 
     def _run_populate_bucketized_permute_test(
@@ -1583,7 +1586,7 @@ class BlockBucketizeTest(unittest.TestCase):
     @settings(verbosity=Verbosity.verbose, max_examples=16, deadline=None)
     def test_block_bucketize_sparse_features_with_variable_batch_sizes(
         self,
-        index_type: Optional[torch.dtype],
+        index_type: torch.dtype | None,
         has_weight: bool,
         bucketize_pos: bool,
         sequence: bool,
@@ -1675,7 +1678,7 @@ class BlockBucketizeTest(unittest.TestCase):
     @settings(verbosity=Verbosity.verbose, max_examples=16, deadline=None)
     def test_block_bucketize_sparse_features_with_block_bucketize_pos(
         self,
-        index_type: Optional[torch.dtype],
+        index_type: torch.dtype | None,
         has_weight: bool,
         bucketize_pos: bool,
         sequence: bool,

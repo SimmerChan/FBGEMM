@@ -14,7 +14,8 @@ import functools
 import logging
 import random
 import unittest
-from typing import Callable
+from collections.abc import Callable
+from typing import Any
 
 import hypothesis.strategies as st
 import numpy as np
@@ -38,7 +39,7 @@ class IndexSelectTest(unittest.TestCase):
             st.lists(st.integers(1, 128), max_size=1),
             st.lists(st.integers(1, 16), min_size=2, max_size=2),
         ),
-        dtype=st.sampled_from([torch.float, torch.half]),
+        dtype=st.sampled_from([torch.float, torch.half, torch.uint8, torch.int8]),
         use_cpu=st.booleans() if gpu_available else st.just(True),
         consecutive_indices=st.booleans(),
         skip_indices_sorting_fwd=st.booleans(),
@@ -76,15 +77,25 @@ class IndexSelectTest(unittest.TestCase):
 
         kwargs["skip_indices_sorting_fwd"] = skip_indices_sorting_fwd
 
-        input = torch.rand((U,) + tuple(shape), dtype=dtype, device=device)
+        if dtype.is_floating_point:
+            input = torch.rand((U,) + tuple(shape), dtype=dtype, device=device)
+        else:
+            iinfo = torch.iinfo(dtype)
+            input = torch.randint(
+                iinfo.min,
+                iinfo.max + 1,
+                (U,) + tuple(shape),
+                dtype=dtype,
+                device=device,
+            )
 
         with torch.inference_mode() if use_inference_mode else contextlib.nullcontext():
             output_ref = torch.ops.fbgemm.index_select_dim0(input, indices, **kwargs)
             output = torch.index_select(input, 0, indices)
 
-            torch.testing.assert_close(output, output_ref)
+            torch.testing.assert_close(output, output_ref, atol=0, rtol=0)
 
-        if not use_inference_mode:
+        if not use_inference_mode and dtype.is_floating_point:
             gradcheck_args = [
                 input.clone().detach().float().requires_grad_(True),
                 indices,
@@ -431,7 +442,7 @@ class IndexSelectTest(unittest.TestCase):
         device: torch.device = (
             torch.device("cpu")
             if use_cpu
-            else torch.device(torch.accelerator.current_accelerator())
+            else torch.device(torch.accelerator.current_accelerator() or "cuda")
         )
         input_rows = torch.randint(
             low=1, high=max_input_rows, size=(num_inputs,)
@@ -496,7 +507,7 @@ class IndexSelectTest(unittest.TestCase):
     ) -> None:
         assume(max_rl < num_indices)
         device: torch.device = (
-            torch.device(torch.accelerator.current_accelerator())
+            torch.device(torch.accelerator.current_accelerator() or "cuda")
             if torch.accelerator.is_available()
             else torch.device("cpu")
         )
@@ -532,8 +543,7 @@ class IndexSelectTest(unittest.TestCase):
 # e.g. "test_faketensor__test_cumsum": [unittest.expectedFailure]
 # Please avoid putting tests here, you should put operator-specific
 # skips and failures in deeplearning/fbgemm/fbgemm_gpu/test/failures_dict.json
-# pyre-ignore[24]: Generic type `Callable` expects 2 type parameters.
-additional_decorators: dict[str, list[Callable]] = {
+additional_decorators: dict[str, list[Callable[..., Any]]] = {
     "test_aot_dispatch_dynamic__test_index_select_dim0": [unittest.skip("hangs")],
     "test_aot_dispatch_static__test_index_select_dim0": [unittest.skip("hangs")],
     "test_faketensor__test_index_select_dim0": [unittest.skip("hangs")],
