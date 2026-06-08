@@ -8,6 +8,8 @@
 # found in:
 # https://github.com/github/gitignore/
 
+.zread/
+
 # General
 .DS_Store
 *~
