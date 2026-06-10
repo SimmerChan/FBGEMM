@@ -54,6 +54,64 @@ FBGEMM 全部用 **runtime API**（**未使用** `__managed__` 编译期变量�
 | `cudaMemAttachGlobal` / `cudaMemAttachHost` | 限制 UVM 可见范围 | ❌ 未使用（默认 Global） |
 | `__managed__` 编译期变量 | 编译期声明 UVM 变量 | ❌ 未使用 |
 
+#### 1.3.1 `cudaMemAdvise` 的本质：**性能优化提示（hint），不是访问控制**
+
+> ⚠️ **这是最容易被误解的语义**。在 FBGEMM 文档和很多社区文章中，"把 UVM 内存 advise 给 X 卡"的说法容易让读者以为 X 卡获得了某种"专属访问权"。**这是错的**。
+
+| 误解 | 真相 |
+|---|---|
+| "advise 给卡 0 之后，卡 1 就不能访问了" | ❌ 错。卡 1 **仍能访问**，只是访问时**没有享受任何性能优化** |
+| "advise 是访问控制" | ❌ 错。UVM 的访问控制由 **OS 页表** 负责（read/write/exec 权限），与 advise 无关 |
+| "不 advise 给卡 1，卡 1 访问会失败" | ❌ 不会失败，但首次访问会触发 **page fault**（几十~几百 μs 抖动） |
+| "advise 是声明给 driver 的 hint" | ✅ **正确**。告诉 driver "这片内存将来被谁用，请按这个意图优化内存布局" |
+
+**6 种 advice 的本质语义分类**：
+
+| Advice | 实际语义 | driver 收到 hint 后会做什么 |
+|---|---|---|
+| `SetPreferredLocation` | "这片内存的**家**在 X"（X 可以是 device 或 host） | page fault 时**优先把页迁回 X**；避免乱迁移 |
+| `UnsetPreferredLocation` | 解除上一条 | — |
+| `SetAccessedBy` | "X device 将来要访问它" | 预先在 X device 上建立 **direct mapping**，访问时**不触发 page fault** |
+| `UnsetAccessedBy` | 解除上一条 | — |
+| `SetReadMostly` | "只读热点" | 在多 device 场景下**复制**到 X device 的 cache，避免反复迁移 |
+| `UnsetReadMostly` | 解除上一条 | — |
+
+**类比**：
+- `SetPreferredLocation` ≈ "建议仓库把货放在 A 货架"（管理建议）
+- `SetAccessedBy` ≈ "建议给 B 工人办一张 A 货架通行证"（让 B 来去自如）
+- 但 C 工人**理论上仍能进仓库**——只是门卫要现场查证件、还要临时给他办手续（page fault + migrate）
+
+#### 1.3.2 FBGEMM 单卡边界的真正成因（不是被技术阻止，是被设计选择）
+
+```cpp
+// memory_utils.cu:202-227
+gpuMemAdvise(ptr, size_bytes, cudaMemAdviseSetPreferredLocation, cudaCpuDeviceId);
+gpuMemAdvise(ptr, size_bytes, cudaMemAdviseSetAccessedBy, current_device());
+//                                                  ^^^^^^^^^^^^^^^
+//                                                  永远是本进程当前那张卡
+```
+
+**事实**：
+- FBGEMM 只 `SetAccessedBy` 给本进程当前那张卡
+- **理论可能性**（FBGEMM 没用）：可以循环 N 次 `SetAccessedBy(card_0), SetAccessedBy(card_1), ...` 让同节点所有卡都建立 direct mapping
+- **结果**：
+  - 本卡访问：零 page fault（享受 advise 优化）
+  - 其他卡访问：每次 fault（未享受 advise 优化）
+
+> 💡 **关键洞察**：FBGEMM UVM 的"单卡"边界**不是被 CUDA 技术阻止**的，而是**被 FBGEMM 主动设计**出来的——FBGEMM 主动选择只 advise 给本卡。如果需要多卡共享一片 UVM 内存，代码上完全可以做到，只是 FBGEMM 选择了不这么做（这与"FBGEMM 是单 rank 算子库"的设计定位一致）。
+
+#### 1.3.3 跨卡访问的合法路径（既然 advise 不是访问控制，那跨卡访问怎么办？）
+
+由于 advise **不阻止**其他卡访问，技术上可以走两条路：
+
+| 路径 | 机制 | 性能 | FBGEMM 用法 |
+|---|---|---|---|
+| **A. 让其他卡也走 UVM 路径** | 在其他卡进程中也 `SetAccessedBy` 同一片 UVM 内存 + 接受 page fault 代价 | 差（每次 fault） | ❌ 不用 |
+| **B. 显式 P2P `cudaMemcpy`** | `cudaMemcpy(device_to_device)` 配合 P2P 启用（`cudaDeviceEnablePeerAccess`） | 好（同节点 NVLink 直连） | ❌ 不用 |
+| **C. NCCL collective** | `torch.distributed.all_to_all_single` 等 | 优（NVLink / IB 优化路径） | ✅ 实际做法（**通过 TorchRec 调用**） |
+
+FBGEMM 选择路径 C（实际是 TorchRec 在调），把跨卡/跨节点通信完全交给上层框架。UVM 在 FBGEMM 中只负责"**本卡 HBM 装不下时**的容量扩展"，**不**参与跨卡协调。
+
 ### 1.4 硬件代价（理解 UVM 为何需要调优）
 
 - **PCIe Gen4 ×16 ≈ 32 GB/s**；**PCIe Gen5 ×16 ≈ 64 GB/s**
@@ -330,16 +388,19 @@ NVLink 4         : 900 GB/s
 
 ### 4.3 "Use UVM when..." 决策表
 
-| 触发条件 | 说明 |
-|---|---|
-| **嵌入表总容量 ≫ 单卡 HBM** | 100 GB 表 + 80 GB HBM 是最直接触发条件 |
-| **访问极端稀疏且长尾** | batch 触达 < 5%，HBM 命中率 < 5%，硬塞 HBM 是浪费 |
-| **冷热分层访问** | 少量行频繁（热），大量行偶尔（冷），非常契合 `MANAGED_CACHING` + LRU/LFU |
-| **多卡 / 多节点共享同一张表** | UVM page migration 避免多卡显式同步 |
-| **训练 + 推理同一份参数** | 优化器在 CPU update、forward 在 GPU lookup，UVM 同一份指针即可 |
-| **不想写复杂分片/分桶代码** | 原型期 / 跨业务线共用表 |
-| **NVMe-backed 之外的次选** | SSD cache 之外的 DRAM 级折中 |
-| **需要 host-mapped 行为** | `uvm_host_mapped=True` 走 `cudaHostRegister`，对 fork 更友好 |
+> ⚠️ **本表是 2026-06-10 更正版**：之前版本中"多卡 / 多节点共享同一张表 → UVM page migration 避免多卡显式同步"的说法**是错误的**——UVM 在 FBGEMM 中只有"**单进程 / 单节点**"半径（详见 §10 边界澄清）。
+
+| 触发条件 | 说明 | 半径 |
+|---|---|---|
+| **嵌入表总容量 ≫ 单卡 HBM** | 100 GB 表 + 80 GB HBM 是最直接触发条件 | 单卡 |
+| **访问极端稀疏且长尾** | batch 触达 < 5%，HBM 命中率 < 5%，硬塞 HBM 是浪费 | 单卡 |
+| **冷热分层访问** | 少量行频繁（热），大量行偶尔（冷），非常契合 `MANAGED_CACHING` + LRU/LFU | 单卡 |
+| **单节点内多卡共享同一张表** | ⚠️ UVM 在单节点内通过 P2P/NVLink 间接可能，但 FBGEMM **不直接用** | 单节点多卡（理论） |
+| **跨节点共享同一张表** | ❌ UVM **不适用**——由 TorchRec + NCCL/HCCL 做 sharding + all_to_all 解决 | **UVM 范围外** |
+| **训练 + 推理同一份参数** | 优化器在 CPU update、forward 在 GPU lookup，UVM 同一份指针即可 | 单卡 |
+| **不想写复杂分片/分桶代码** | 原型期 / 跨业务线共用表 | 单卡 |
+| **NVMe-backed 之外的次选** | SSD cache 之外的 DRAM 级折中 | 单卡 |
+| **需要 host-mapped 行为** | `uvm_host_mapped=True` 走 `cudaHostRegister`，对 fork 更友好 | 单卡 |
 
 ### 4.4 "不要使用 UVM" 反例
 
@@ -534,15 +595,16 @@ GenAI MoE:
 
 ### 8.2 决策速查表
 
-| 场景 | 推荐方案 | FBGEMM 开关 |
-|---|---|---|
-| 推荐系统 embedding 表 ≤ 80 GB，单卡 HBM 装得下 | **HBM** | `EmbeddingLocation.DEVICE` |
-| 推荐系统 embedding 表 80 GB – 几百 GB，单 batch 触达 < 5% | **UVM + HBM cache**（首推） | `EmbeddingLocation.MANAGED_CACHING` + `cache_load_factor=0.2` |
-| 推荐系统 embedding 表 > 几百 GB，DRAM 也不够 | **SSD TBE + UVM** | `ssd_split_embeddings_cache` + `EmbeddingLocation.MANAGED` |
-| GenAI 量化 LLM 推理（dense） | **TP/PP + 量化** | 不使用 UVM |
-| GenAI MoE 推理（专家稀疏激活） | **未来 UVM 复兴场景** | （FBGEMM_GPU 尚未原生支持） |
-| 多卡共享大表 | UVM + `SetReadMostly` + `SetAccessedBy` | `MANAGED` + `cudaMemAdvise` |
-| 极致低延迟（< 5ms P99） | **预热 + 全 HBM** | `EmbeddingLocation.DEVICE` |
+| 场景 | 推荐方案 | FBGEMM 开关 | 半径 |
+|---|---|---|---|
+| 推荐系统 embedding 表 ≤ 80 GB，单卡 HBM 装得下 | **HBM** | `EmbeddingLocation.DEVICE` | 单卡 |
+| 推荐系统 embedding 表 80 GB – 几百 GB，单 batch 触达 < 5% | **UVM + HBM cache**（首推） | `EmbeddingLocation.MANAGED_CACHING` + `cache_load_factor=0.2` | 单卡 |
+| 推荐系统 embedding 表 > 几百 GB，DRAM 也不够 | **SSD TBE + UVM** | `ssd_split_embeddings_cache` + `EmbeddingLocation.MANAGED` | 单卡 |
+| GenAI 量化 LLM 推理（dense） | **TP/PP + 量化** | 不使用 UVM | — |
+| GenAI MoE 推理（专家稀疏激活） | **未来 UVM 复兴场景** | （FBGEMM_GPU 尚未原生支持） | — |
+| 单节点内多卡共享大表 | UVM + `SetReadMostly` + `SetAccessedBy` | `MANAGED` + `cudaMemAdvise` | 单节点（理论可行，FBGEMM 不直接用） |
+| **跨节点分布式训练（4 节点 32 卡）** | **TorchRec sharding + NCCL/HCCL all_to_all** | FBGEMM 接收 `embedding_shard_info` 元组，**不参与跨节点通信** | **UVM 范围外** |
+| 极致低延迟（< 5ms P99） | **预热 + 全 HBM** | `EmbeddingLocation.DEVICE` | 单卡 |
 
 ### 8.3 一页速查
 
@@ -707,6 +769,101 @@ FBGEMM 中 UVM 的 5 件事:
 - **NVIDIA CUDA Unified Memory Programming Guide**：https://docs.nvidia.com/cuda/cuda-c-programming-guide/04-special-topics/unified-memory.html
 - **Linux HMM 文档**：`Documentation/mm/hmm.rst`
 - **Meta Engineering Blog**（FBGEMM 介绍）：https://engineering.fb.com/2021/06/15/open-source/fbgemm/
+
+---
+
+## 10. UVM 在 FBGEMM 中的边界澄清（**2026-06-10 增补**）
+
+> **本节是对全文中"UVM 跨卡 / 跨节点"相关说法的正式澄清。** 之前的 §1.4、§4.3、§5 表格中部分表述容易给读者造成"UVM 可以解决跨节点访问"的误解，本节明确边界。
+
+### 10.1 核心结论（一句话）
+
+> **UVM 在 FBGEMM 中只有"单进程 / 单节点"的半径。** 跨节点（多机）embedding 访问由 **TorchRec sharding + NCCL/HCCL all_to_all** 解决，**与 UVM 完全无关**。
+
+### 10.2 用户原问题答复
+
+> **Q: 32 卡训练（4 节点 × 8 卡），卡 0 在服务器 1，卡 31 在服务器 4，卡 0 能直接访问卡 31 的 UVM 中 emb 数据么？**
+
+**A: 不能。** 具体见下方三层解释。
+
+#### 10.2.1 FBGEMM 源码层：UVM 路径不感知"其他节点"
+
+- [`fbgemm_gpu/fbgemm_gpu/uvm.py`](fbgemm_gpu/fbgemm_gpu/uvm.py) 全文 41 行，只暴露 `cudaMemAdvise` 和 `cudaMemPrefetchAsync` 两个包装函数
+- [`fbgemm_gpu/src/memory_utils/memory_utils.cu`](fbgemm_gpu/src/memory_utils/memory_utils.cu:147-186) 中 `cudaMemLocation` 的 type 字段**只支持 `Device` 和 `Host` 两种**——没有 `cudaMemLocationTypeDeviceNvidiaPeer`、没有 NUMA 节点、没有跨节点概念
+- FBGEMM 整个仓库（`fbgemm_gpu/src/` 和 `fbgemm_gpu/fbgemm_gpu/`）grep `torch.distributed` / `init_process_group` / `nccl*` / `all_to_all` / `world_size` / `process_group` —— **全部 0 命中**（排除 `experimental/gen_ai/`）
+- `MANAGED` / `MANAGED_CACHING` 的 `cudaMemAdvise` 目标位置永远是：`cudaCpuDeviceId`（**当前节点 host**）或 `t.get_device()`（**当前进程当前 GPU**）
+
+#### 10.2.2 FBGEMM 架构层：FBGEMM 是"单 rank 算子库"
+
+- [`split_table_batched_embeddings_ops_training.py:646-649`](fbgemm_gpu/fbgemm_gpu/split_table_batched_embeddings_ops_training.py#L646) 接收 `embedding_shard_info` 元组 `(preshard_table_height, preshard_table_dim, height_offset, dim_offset)`，告诉它"我这个 rank 上这张表被切成什么样子"
+- FBGEMM 假设整张全局表已经按 row-wise / table-wise / column-wise 在所有 rank 上静态划分完毕，**它自己不做 sharding 决策**
+- [`fbgemm_gpu/bench/README.md:5-6`](fbgemm_gpu/bench/README.md#L5) 原文：
+  > *"[Torchrec](https://pytorch.org/torchrec/) uses fbgemm_gpu embedding and embedding bag implementations for Fused, Batched, Quantized versions of embedding and embeddingbag (in addition to other kernels)."*
+  即 **FBGEMM 是被 TorchRec 调用的 kernel 提供方**，分布式编排交给 TorchRec
+
+#### 10.2.3 NVIDIA 架构层：CUDA UVM 不跨节点
+
+- CUDA Managed Memory 的 page table 由单节点内统一虚拟地址空间管理（同一 OS 进程内）
+- 跨节点需要走 NCCL/Gloo + RDMA/IB——**UVM 的 page fault/migrate 机制不延伸到跨节点 GPU**
+- 即便 NVIDIA 12.x/13.x 引入了 NUMA 改进，也仍是"单节点内多 socket"层级，**不延伸到多机**
+- 这是 NVIDIA 文档与驱动的硬约束，不是 FBGEMM 的实现选择
+
+### 10.3 实际跨节点访问流程（4 节点 32 卡示例）
+
+以 DLRM 32 卡训练为例，假设 batch 分散到 32 个 rank 上：
+
+```
+                     节点 1                              节点 4
+                ┌──────────────┐                   ┌──────────────┐
+                │ 卡 0..7      │                   │ 卡 24..31    │
+                │ emb[0..7/32] │                   │ emb[24..31/32]│
+                └──────────────┘                   └──────────────┘
+                       │                                  ▲
+                       │  step 1: torch.distributed.all_to_all_single
+                       │         把 indices 按 rank 路由 (底层走 IB/RoCE via NCCL)
+                       ▼                                  │
+                ┌──────────────────────────────────────────┐
+                │  各 rank 本地 lookup, 走 FBGEMM TBE      │
+                │  (本 rank 内的 idx 查本 rank 的 emb 分片)  │
+                │  → 返回局部 pooled embedding              │
+                └──────────────────────────────────────────┘
+                                │
+                                ▼
+                ┌──────────────────────────────────────────┐
+                │  torch.distributed.all_to_all_single (回程)│
+                │  把 pooled embedding 按原 batch 顺序回拼   │
+                └──────────────────────────────────────────┘
+```
+
+**关键**：
+- 跨节点走 **NCCL**（GPU backend），底层走 **InfiniBand / RoCE**；NCCL 内部用 `libnccl`，**完全脱离 FBGEMM 的 UVM 路径**
+- FBGEMM 只负责"本 rank 内的 lookup"，对 ranks 间的分布"完全无知"
+- **没有任何代码路径让卡 0 通过 UVM 直接读到卡 31 的内存**
+
+### 10.4 UVM 半径决策表（最终版）
+
+| 半径 | 是否能用 UVM | FBGEMM 是否实际使用 | 备注 |
+|---|---|---|---|
+| **同一进程 + 同一节点：CPU ↔ 单卡 HBM** | ✅ | ✅ `MANAGED` / `MANAGED_CACHING` | 唯一主战场 |
+| **同一进程 + 同一节点：CPU ↔ 8 卡 HBM（NVLink）** | ✅ 理论 | ⚠️ 通过 `SetAccessedBy` 多卡 hint | FBGEMM 不强制使用 |
+| **同一进程 + 同一节点：卡 0 ↔ 卡 1（P2P）** | ✅ 理论可行 | ❌ 不直接使用 | 由 `nv_peer_mem` 兜底 |
+| **不同进程 + 同一节点** | ❌ | — | 进程隔离 |
+| **跨节点（卡 0 在服务器 1，卡 31 在服务器 4）** | ❌ | ❌ | **由 TorchRec + NCCL/HCCL all_to_all 解决** |
+
+### 10.5 错误说法清单（已修正）
+
+| 位置 | 原错误说法 | 修正后 |
+|---|---|---|
+| §4.3 决策表 | "多卡 / 多节点共享同一张表 → UVM page migration 避免多卡显式同步" | 拆为"单节点多卡（理论）"和"跨节点（UVM 范围外，由 TorchRec 解决）"两行 |
+| §8.2 决策速查表 | "多卡共享大表 → UVM + SetReadMostly" | 限定为"**单节点内**多卡"；新增"跨节点分布式训练 → TorchRec sharding + NCCL/HCCL"行 |
+| §1.4 战略价值 | "UVM 是 FBGEMM / TorchRec 的事实依赖" | 限定为"**单卡 HBM 装不下**时的依赖"；跨节点由 NCCL/HCCL 解决 |
+
+### 10.6 启示
+
+1. **FBGEMM UVM 需求基线以"单卡 HBM 装不下"为核心**，不要被"统一内存"字面意思误导到"跨节点"
+2. **跨节点需求不在 FBGEMM 范围内**，由 TorchRec + 集合通信解决
+3. **昇腾 950 系列补 UVM 能力**也只解决"单卡 HBM 容量"问题；**跨节点通信的 RDMA / IB / HCCL over RoCE 是另一条独立产品线**（属于 HCCL/集合通信范畴）
+4. 写"UVM 需求"文档时，**不要把跨节点需求与 UVM 混在一起**——这是两个独立的软件栈
 
 ---
 
