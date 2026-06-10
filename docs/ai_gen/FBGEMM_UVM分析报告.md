@@ -267,6 +267,68 @@ class EmbeddingLocation(IntEnum):
 (4) HOST          = placing an embedding table in the CPU memory (DRAM)
 ```
 
+#### 3.2.1.1 MANAGED 与 MANAGED_CACHING 的物理存储位置（关键澄清，2026-06-10 增补）
+
+> **docstring 容易让人误解的一句话**：
+> > `MANAGED = placing an embedding in the unified virtual memory (accessible from both GPU and CPU)`
+>
+> "accessible from both GPU and CPU" 指的是**虚拟地址层面的可访问性**（同一个指针，CPU 和 GPU 都能解引用），**不是说"数据物理上同时存在于 HBM 和 CPU"**。UVM 的本质是：每个 page 任意时刻只能在一个物理位置（CPU DRAM 或 GPU HBM），driver/HMM 根据访问模式自动迁移。
+
+| 维度 | MANAGED | MANAGED_CACHING |
+|---|---|---|
+| `weights_uvm`（UVM 主存池） | ✅ 100% 权重都在这 | ✅ 100% 权重都在这 |
+| `lxu_cache_weights`（FBGEMM 显式 HBM cache 池） | ❌ **不分配**（`numel() == 0`） | ✅ **显式分配**（`cache_load_factor × total_rows × D`） |
+| HBM 中**是否有数据** | ✅ 有（driver 自动迁移的 hot page） | ✅ 有（FBGEMM 显式 cache 拷贝） |
+| HBM 占用**是否可调** | ❌ 不可调（driver 启发式决定） | ✅ `cache_load_factor`（默认 0.2）直接控制 |
+| 热点由谁管理 | CUDA driver + Linux HMM（启发式） | FBGEMM LRU/LFU/Direct-mapped kernel（精确） |
+| `SetAccessedBy(GPU)` 角色 | **关键**——预装 direct mapping 避免首次 fault | 不重要（kernel 自己会处理 miss） |
+| forward kernel 路径 | `use_lxu_cache = false`（直读 `weights_uvm`） | `use_lxu_cache = true`（先查 cache，再 fallback 到 `weights_uvm`） |
+
+**MANAGED 模式的物理位置演化**：
+
+```
+        分配完成                  GPU 反复访问 hot page 后
+        ┌─────────────┐           ┌─────────────┐
+        │  CPU DRAM   │           │  CPU DRAM   │  ← 冷 page
+        │  (100% 权重) │           │  (冷 page)   │
+        └─────────────┘           └─────────────┘
+                                  ┌─────────────┐
+                                  │  GPU HBM    │  ← driver 隐式迁过来的 hot page
+                                  │ (working set)│
+                                  └─────────────┘
+```
+
+- `cudaMallocManaged` 初始分配 100% 在 CPU DRAM
+- `SetPreferredLocation(CPU)` 是 **hint**（不是强约束），driver 可能把 hot page 迁到 HBM
+- `SetAccessedBy(GPU)` 预装 direct mapping，**首次访问不 fault**，但走 PCIe（~32 GB/s）读 CPU 数据；之后 driver 决定是否迁到 HBM
+- HBM 中**也会有数据**——只是 FBGEMM **不能控制**哪部分进 HBM、进多少、何时进出
+
+**MANAGED_CACHING 模式的物理位置**：
+
+```
+        ┌─────────────┐
+        │  CPU DRAM   │  ← 80% 权重（UVM 主存）
+        │  (uvm)       │
+        └─────────────┘
+        ┌─────────────┐
+        │  GPU HBM    │  ← 20% 权重（FBGEMM 显式 cache）
+        │  (lxu_cache) │     由 LRU/LFU kernel 精确管理
+        └─────────────┘
+```
+
+- FBGEMM 显式分配**两个池**：`weights_uvm`（UVM 存主存）+ `lxu_cache_weights`（HBM 存 cache）
+- kernel **先查 cache**：命中走 HBM（~2-3 TB/s）；未命中走 UVM（可能 PCIe 也可能 HBM，取决于 driver 状态）
+- `cache_load_factor`（默认 0.2）直接控制 HBM cache 大小
+
+**两者的本质区别不是"用不用 HBM"，而是"由谁管 HBM 中的热点子集"**：
+- MANAGED = **driver 管**热点（你不能调）
+- MANAGED_CACHING = **FBGEMM 管**热点（你可以通过 `cache_load_factor`、`CacheAlgorithm.LRU/LFU/Direct-mapped` 调）
+
+源码佐证：
+- `lxu_cache_weights` 分配条件：[`split_table_batched_embeddings_ops_training.py:3541-3580, 3602-3630`](fbgemm_gpu/fbgemm_gpu/split_table_batched_embeddings_ops_training.py#L3541)（仅在 `cache_load_factor > 0` 即 `MANAGED_CACHING` 模式下分配）
+- forward kernel 是否用 cache：[`embedding_forward_split_template.cu:602-605`](fbgemm_gpu/codegen/training/forward/embedding_forward_split_template.cu#L602-L605)（`use_lxu_cache = lxu_cache_weights.numel() > 0`）
+- `SetAccessedBy` 的语义：[`memory_utils.cu:212-227`](fbgemm_gpu/src/memory_utils/memory_utils.cu#L212-L227)（"no page faults will be generated"）
+
 #### 3.2.2 `MANAGED_CACHING` 的关键参数
 
 - **`cache_load_factor`**（默认 `0.2`）：HBM cache 大小 = `cache_load_factor` × 所有表行总数
@@ -422,11 +484,12 @@ NVLink 4         : 900 GB/s
 |---|---|---|---|
 | **对应 FBGEMM 开关** | `EmbeddingLocation.DEVICE` | `EmbeddingLocation.HOST` + 手动 `to("cuda")` | `EmbeddingLocation.MANAGED` / `MANAGED_CACHING` |
 | **支持的表规模** | 严格 ≤ HBM（通常 ≤ 80 GB / 卡） | 不限（受 CPU DRAM 限制） | 不限（受 CPU DRAM / NVMe 限制） |
-| **访问延迟** | 最低（一次 memcpy 之后都很快） | 高（每次访问都要 memcpy） | 中——首次 page-fault 高（μs 级），稳态 ≈ 方案 A |
+| **HBM 中是否有数据** | 100% 都在 HBM | 0%（全在 CPU） | **MANAGED**：HBM 也有数据（driver 自动迁移的 hot page，不可控）；**MANAGED_CACHING**：HBM 有显式 cache 池（`cache_load_factor` 决定，可控） |
+| **访问延迟** | 最低（一次 memcpy 之后都很快） | 高（每次访问都要 memcpy） | 中——MANAGED 首次走 PCIe 直读 CPU（~32 GB/s），稳态 hot page 走 HBM ≈ 方案 A；MANAGED_CACHING 命中走 HBM cache（≈ 方案 A），未命中走 UVM |
 | **PCIe 带宽利用率** | 一次性摊销 | 每次访问都吃 PCIe，**极差** | 驱动按页粒度合并，**高** |
 | **代码复杂度** | 低 | 高（显式编排传输） | 中（少量 `cudaMemAdvise` / `prefetch`） |
-| **缓存策略可调** | 难（必须分片/分桶） | 难 | **易**——`MANAGED_CACHING` + `cache_load_factor` + LRU/LFU |
-| **首次访问抖动** | 无 | 无 | 有（GPU 大模型预热时可见） |
+| **缓存策略可调** | 难（必须分片/分桶） | 难 | **MANAGED 不可调**（driver 决定）；**MANAGED_CACHING 易调**——`cache_load_factor` + LRU/LFU/Direct-mapped |
+| **首次访问抖动** | 无 | 无 | 有（GPU 大模型预热时可见；MANAGED_CACHING 抖动更小） |
 | **是否需要分桶/sharding** | **是** | 否 | 否（与方案 A 比，少分桶） |
 | **典型权衡** | 容量天花板最低、性能最稳 | 实现最复杂、浪费最多带宽 | **首推**——容量大、代码简单、驱动调优 |
 
