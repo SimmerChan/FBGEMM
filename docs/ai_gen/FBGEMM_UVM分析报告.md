@@ -336,6 +336,214 @@ class EmbeddingLocation(IntEnum):
 - **`uvm_host_mapped`**：`True` 走 `cudaHostAlloc`（零拷贝），`False` 走 `cudaMallocManaged`（按需分页）
 - **`gather_uvm_cache_stats`**：是否收集 6 项 cache 命中率统计
 
+#### 3.2.2.1 MANAGED_CACHING miss 时的访存行为（5 步流水线，2026-06-11 增补）
+
+> **核心问题**：embedding 不在 HBM cache 时，FBGEMM 怎么把数据从 UVM 拉过来？miss 率靠什么降低？
+
+**完整 forward 循环**（[split_table_batched_embeddings_ops_training.py:2823-2904](fbgemm_gpu/fbgemm_gpu/split_table_batched_embeddings_ops_training.py#L2823)）：
+
+```
+┌──────────────────────────────────────────────────────────────────────────┐
+│ Step 1. linearize_cache_indices                                          │
+│   (table, row) → global hash idx（MANAGED_CACHING 表才有 idx, 其他表填 -1）│
+└──────────────────────────────────────────────────────────────────────────┘
+                                  ↓
+┌──────────────────────────────────────────────────────────────────────────┐
+│ Step 2. lxu_cache_lookup_kernel  [lxu_cache.cu:238-306]  (第一次查找)     │
+│   每个 warp 处理 blockDim.x 个 idx:                                       │
+│     ① cache_slot(idx, C) = MurmurHash3(idx) % C                           │
+│     ② 读 lxu_cache_state[set][0..32]                                     │
+│     ③ __ballot_sync 找匹配 way                                           │
+│   命中 → way, 未命中 → kCacheLocationMissing(-1)                          │
+│   ⚠️ **纯查找**,不更新 LRU,不读写 UVM; 这一步主要为了 gather_uvm_cache_stats│
+└──────────────────────────────────────────────────────────────────────────┘
+                                  ↓
+┌──────────────────────────────────────────────────────────────────────────┐
+│ Step 3. lru_cache_find_uncached_kernel  [lru_cache_find.cu:78-150]        │
+│   ① 对**命中的行**: lru_state[set][slot] = time_stamp (更新访问时间)     │
+│   ② 对**未命中的行**: 把 cache_set 写到 cache_sets 输出                   │
+│   ③ CUB DeviceRadixSort 按 cache_set 归并 (同 set 的 miss 一起处理)      │
+└──────────────────────────────────────────────────────────────────────────┘
+                                  ↓
+┌──────────────────────────────────────────────────────────────────────────┐
+│ Step 4. lru_cache_insert_kernel  [lru_cache_populate.cu:17-165]          │
+│   ← 这就是 UVM ↔ HBM 数据交换的真正发生点                                  │
+│   一个 warp 处理一个 set:                                                  │
+│     ① BitonicSort 在 32 个 LRU 时间戳里找**最久未用**的 way               │
+│     ② 检查 victim 是否 locked (lxu_cache_locking_counter > 0)              │
+│        → locked 跳过 (防止驱逐正在 forward 的行)                          │
+│     ③ **Evict**: warp_cache_evict 把 victim 从 lxu_cache_weights          │
+│                  拷回 weights_uvm (HBM → UVM)                            │
+│     ④ **Load**:  warp_cache_load 把新行从 weights_uvm                     │
+│                  拷到 lxu_cache_weights (UVM → HBM)                       │
+│     ⑤ 更新 lxu_cache_state / lru_state / 锁定计数器                       │
+└──────────────────────────────────────────────────────────────────────────┘
+                                  ↓
+┌──────────────────────────────────────────────────────────────────────────┐
+│ Step 5. lxu_cache_lookup_kernel  (第二次查找)                              │
+│   返回更新后的 lxu_cache_locations                                        │
+│   → forward kernel 用这个 tensor 决定读 HBM cache 还是 fallback UVM       │
+└──────────────────────────────────────────────────────────────────────────┘
+```
+
+**数据交换的粒度**——注意不是页粒度：
+
+| 维度 | FBGEMM cache exchange | CUDA UVM page migration |
+|---|---|---|
+| 粒度 | **一行 (row)**，由 `warp_cache_load`/`warp_cache_evict` 整行搬运 | **4 KB / 2 MB 页** |
+| 触发者 | FBGEMM `lru_cache_insert_kernel` | CUDA driver page fault handler |
+| 替换策略 | LRU / LFU / Direct-mapped（**软件可控**） | 硬件 LRU（**应用不可控**） |
+| 典型 row 大小 | `D × 2B` = 32B (D=16) ~ 512B (D=256) | — |
+
+**关键区别**：MANAGED_CACHING 的交换粒度是 **embedding row**（几十到几百字节），比 UVM 的 2 MB page 小 4000×~60000×。这意味着 cache 替换决策可以做到**行级精确**，但每次交换的 PCIe/NVLink 摊销效率不如 page-level。
+
+**miss 率降低的 5 个机制**：
+
+| 机制 | 实现 | 文件:行 | 效果 |
+|---|---|---|---|
+| **LRU 替换** | 时间戳最小者被驱逐 | [lru_cache_populate.cu:17-165](fbgemm_gpu/src/split_embeddings_cache/lru_cache_populate.cu#L17) | 时间局部性好的工作集 → 高 hit rate |
+| **LFU 替换** | 访问次数最小者被驱逐 | [lfu_cache_populate.cu](fbgemm_gpu/src/split_embeddings_cache/lfu_cache_populate.cu) | 频率局部性好的工作集 → 高 hit rate |
+| **`lock_cache_line`** | 正在 forward 的行不驱逐（`lxu_cache_locking_counter > 0` 跳过 victim） | [lru_cache_populate.cu:222-228](fbgemm_gpu/src/split_embeddings_cache/lru_cache_populate.cu#L222) | 避免热行被反复换入换出（thrashing） |
+| **`prefetch_stream`** | populate 跑在 `self.prefetch_stream` 上，与主 stream 的 forward/backward overlap | [training.py:3669-3680](fbgemm_gpu/fbgemm_gpu/split_table_batched_embeddings_ops_training.py#L3669) | 隐藏 cache populate 的 latency |
+| **`gather_uvm_cache_stats`** | 暴露 6 项命中率指标，用户可据此调 `cache_load_factor` | [training.py:184-190](fbgemm_gpu/fbgemm_gpu/split_table_batched_embeddings_ops_training.py#L184) | 调优闭环 |
+
+外加一个**测试用**机制 `emulate_cache_miss_kernel`（[lru_cache_find.cu:16-38](fbgemm_gpu/src/split_embeddings_cache/lru_cache_find.cu#L16)）：强制每 256 个访问中 `enforced_misses_per_256` 个走 miss，用来复现低 hit-rate 场景做鲁棒性测试。
+
+#### 3.2.2.2 容量构成：HBM cache + UVM 主存 = 整张表（2026-06-11 增补）
+
+> **核心问题**：MANAGED_CACHING 的总占用是 HBM+UVM 还是只 UVM？两者关系？
+
+**是的，整张表 = HBM cache + UVM 主存**，两者是同一份权重的不同副本：
+
+```
+权重全集 (total_rows × D × 2B)
+    ├── lxu_cache_weights   [C × A, D]   ← HBM 副本（cache_load_factor 部分）
+    │       cache_load_factor = (C × A) / total_rows
+    │       默认 0.2 → 20% 行在 HBM
+    │
+    └── weights_uvm         [total_rows, D]  ← UVM 主存（100% 行都在这）
+```
+
+**关键代码** [training.py:3541-3580](fbgemm_gpu/fbgemm_gpu/split_table_batched_embeddings_ops_training.py#L3541)：
+
+```python
+cache_sets = (
+    int(cache_state.total_cache_hash_size * cache_load_factor)
+    + DEFAULT_ASSOC - 1
+) // DEFAULT_ASSOC
+# lxu_cache_weights 大小 = cache_sets × DEFAULT_ASSOC × D × 2B
+# 举例: 1e8 行 × D=128 × fp16, cache_load_factor=0.2
+#   = 1e8 × 0.2 × 128 × 2B = 4.8 GB（HBM 占用）
+#   = 1e8 × 128 × 2B = 24 GB（UVM 占用）
+```
+
+**两个池子的一致性保证**——[embedding_inplace_update.cu:84-98](fbgemm_gpu/src/embedding_inplace_ops/embedding_inplace_update.cu#L84) 优化器写入时**双写**：
+
+```cpp
+bool cache_valid = (weights_placement == PlacementType::MANAGED_CACHING);
+if (cache_valid && cache_idx != kCacheLocationMissing) {
+    // 同时写 UVM 主存 和 HBM cache 行
+}
+```
+
+**总占用估算**：
+
+- 默认 0.2 下：`HBM 0.2×表 + UVM 1.0×表 ≈ 1.2×单表容量`
+- 不是"刚好整张表"，而是**略多一点**（cache 副本是冗余的）
+- UVM 中也有"被 cache 命中过、又被 evict 回来"的行（冗余存储）
+- evict 路径（`warp_cache_evict`）就是把 HBM 副本写回 UVM 主存，保证两者最终一致
+
+#### 3.2.2.3 动态扩容：不存在（2026-06-11 增补）
+
+> **核心问题**：HBM 或 UVM 不够用时，FBGEMM 能否自动扩充？
+
+**简短回答：没有。** 用户必须自己选 placement。
+
+##### HBM cache 大小——构造时一次性确定，运行时不变
+
+```python
+# 构造时（split_table_batched_embeddings_ops_training.py:3541-3580）：
+cache_sets = ceil(total_cache_hash_size × cache_load_factor / DEFAULT_ASSOC)
+# 然后 register_buffer 分配 lxu_cache_weights / lxu_cache_state / lru_state
+# 这些 buffer 不可 resize，PyTorch 也只是 register_buffer 而非 Parameter
+```
+
+- **没有 `resize_cache()` 这种 API**
+- 唯一例外：构造时如果 `cache_size > free_HBM`，代码会**一次性自动缩到能装下的最大值**：
+
+```python
+if cache_size > free_memory:    # free_memory = 当前卡可用 HBM
+    cache_sets = int(1.0 * free_memory / self.max_D_cache / element_size) // DEFAULT_ASSOC
+    cache_load_factor = 1.0 * cache_sets * DEFAULT_ASSOC / int(total_cache_hash_size)
+```
+
+这是**一次性的"安全降级"**，不是动态扩容——一旦构造完成就不再变。
+
+##### UVM 内存——由 `cudaMallocManaged` 一次性分配，不动态扩
+
+[memory_utils.cu:88-97](fbgemm_gpu/src/memory_utils/memory_utils.cu#L88)：
+
+```cpp
+AT_CUDA_CHECK(cudaMallocManaged(&ptr, size_bytes));
+```
+
+- 一次性分配整张表大小
+- 系统内存不足时 → **OOM**（不是动态找 NVMe）
+- 没有任何 "if OOM then go to NVMe" 的 fallback 逻辑
+
+##### "HBM 不够"的处置清单
+
+| 触发条件 | FBGEMM 提供的能力 | 自动化？ |
+|---|---|---|
+| 单表能装进 HBM | `EmbeddingLocation.DEVICE` | ❌ 手动选 |
+| 单表装不下 HBM，但 working set < 20% | `MANAGED_CACHING` + `cache_load_factor` | ❌ 手动选 |
+| 单表装不下 HBM，且 working set 不可刻画 | `MANAGED` | ❌ 手动选 |
+| 单表连 CPU DRAM 都装不下 | **SSD TBE**（`ssd_split_embeddings_cache`） | ❌ 手动选 |
+| Cache 装不下请求的 `cache_load_factor` | 自动缩到 free HBM | ✅（一次性降级） |
+| HBM 真的不够了 | **无 fallback** → OOM | ❌ |
+
+**SSD TBE 是真正的"溢出层"**，但它是**独立的算子**（`SSDTableBatchedEmbedding`），不是 `MANAGED_CACHING` 的扩展：
+
+- 权重存在 NVMe SSD
+- DRAM 级用 UVM 池子做 cache
+- 由专门的 [`kv_db_table_batched_embeddings.cpp`](fbgemm_gpu/src/ssd_split_embeddings_cache/kv_db_table_batched_embeddings.cpp) / SSD-specific Python 类管
+- **用户在构造时**决定"哪些表用 SSD TBE"，不是运行时切换
+
+##### 为什么不自动扩容？
+
+工程上的几个原因：
+
+1. **PyTorch 生态的 `register_buffer` 不支持 resize**——一旦 buffer 分配，`data_ptr()` 就不变，任何引用都得跟着重定位
+2. **kernel 启动时 cache 维度是编译期常量**（如 `kWarpSize = 32`），改 cache 大小要重编
+3. **bump allocator 模式会有碎片化问题**，DLRM 这种 hot/cold 极不均衡的 workload 上不划算
+4. **预测 cache 命中率需要历史信息**，运行早期不知道 working set 大小，盲目扩容可能反而浪费 HBM
+
+##### 用户能用的"半自动"机制（FBGEMM 不内置，需用户自写）
+
+虽然 FBGEMM 本身不动态扩容，但提供了**可观测性**让你**手动**做这件事：
+
+```python
+# 1. 打开 cache 命中率监控
+emb.gather_uvm_cache_stats = True
+
+# 2. 训练中定期看
+stats = emb.get_uvm_cache_stats()
+# stats[UVMCacheStatsIndex.num_calls]               # 总访问次数
+# stats[UVMCacheStatsIndex.num_unique_indices]      # 唯一访问行数
+# stats[UVMCacheStatsIndex.num_unique_misses]       # 唯一 miss 行数
+# hit_rate = 1 - num_unique_misses / num_unique_indices
+
+# 3. hit rate 低 → 手动调大 cache_load_factor，重建 emb
+if hit_rate < 0.8:
+    new_emb = SplitTableBatchedEmbeddingsTraining(
+        ...,
+        cache_load_factor=0.4,   # 翻倍
+    )
+    # state_dict 拷过去
+    new_emb.load_state_dict(emb.state_dict())
+    emb = new_emb
+```
+
 #### 3.2.3 UVMCacheStatsIndex（6 项统计指标）
 
 `fbgemm_gpu/fbgemm_gpu/split_table_batched_embeddings_ops_training.py:184-190`：
