@@ -41,16 +41,17 @@
 
 ### 1.3 关键 API 三件套
 
-FBGEMM 全部用 **runtime API**（**未使用** `__managed__` 编译期变量、`cuMemAllocManaged` driver API、`cudaStreamAttachMemAsync`）：
+FBGEMM 全部用 **runtime API**（**未使用** `__managed__` 编译期变量、`cuMemAllocManaged` driver API、`cudaStreamAttachMemAsync`、以及**纯 `cudaMalloc`**——所有 GPU 内存分配要么走 UVM 要么走 host-mapped，**没有第三种**）。宏适配方面（**2026-06-12 增补**）：**只有 `gpuMemAdvise` 一个宏**（[memory_utils.cu:159-162](fbgemm_gpu/src/memory_utils/memory_utils.cu#L159) 定义，ROCm 7.1+ 走 `hipMemAdvise_v2`、CUDA 走 `cudaMemAdvise`）；`cudaMallocManaged`（line 97）和 `cudaMemPrefetchAsync`（line 450）都是**直接调**，靠 HIP runtime 自带的同名 alias 实现 ROCm 兼容。`gpuMemLocation` 是 v2 API 的类型别名（line 148-150），用于在 CUDA 13+ / ROCm 7.1+ 时把 `int device` 升级为 `cudaMemLocation` struct。
 
 | API | 作用 | FBGEMM 是否使用 |
 |---|---|---|
-| `cudaMallocManaged(&ptr, size)` | 分配 UVM 内存 | ✅ 核心入口 |
-| `cudaMemAdvise(ptr, ..., SetPreferredLocation, dev)` | 声明"数据归属哪个 device/host" | ✅ 分配后立即调用 |
-| `cudaMemAdvise(ptr, ..., SetAccessedBy, dev)` | 声明"某 device 即将访问"，建立 direct mapping **避免 page fault** | ✅ 分配后立即调用 |
-| `cudaMemAdvise(ptr, ..., SetReadMostly)` | 标记只读热点，pin 在某 device 上 | ⚠️ 暴露给 Python，未默认使用 |
-| `cudaMemPrefetchAsync(ptr, ..., dstDev, stream)` | **主动**把页搬到目标 device | ✅ 暴露给 Python (`uvm_cuda_mem_prefetch_async`) |
-| `madvise(MADV_DONTFORK)` | Workaround fork 场景下 UVM 的问题 | ✅ `uvm_mem_advice_dont_fork` |
+| `cudaMallocManaged(&ptr, size)` | 分配 UVM 内存 | ✅ 核心入口（直接调，无宏） |
+| `cudaMemAdvise(ptr, ..., SetPreferredLocation, dev)` | 声明"数据归属哪个 device/host" | ✅ 分配后立即调用（经 `gpuMemAdvise` 宏） |
+| `cudaMemAdvise(ptr, ..., SetAccessedBy, dev)` | 声明"某 device 即将访问"，建立 direct mapping **避免 page fault** | ✅ 分配后立即调用（经 `gpuMemAdvise` 宏） |
+| `cudaMemAdvise(ptr, ..., SetReadMostly)` | 标记只读热点，pin 在某 device 上 | ⚠️ 暴露给 Python（未默认使用） |
+| `cudaMemAdvise(ptr, ..., Unset*)` × 3 种 | 解除对应的 advice | ⚠️ 暴露给 Python（未默认使用） |
+| `cudaMemPrefetchAsync(ptr, ..., dstDev, stream)` | **主动**把页搬到目标 device | ✅ 暴露给 Python (`uvm_cuda_mem_prefetch_async`)，FBGEMM 内部不调 |
+| `madvise(MADV_DONTFORK)` | Workaround fork 场景下 UVM 的问题 | ✅ **`new_managed_tensor` 内部自动调用**（[line 234](fbgemm_gpu/src/memory_utils/memory_utils.cu#L234)），用户也可用 `uvm_mem_advice_dont_fork` 显式再调（[line 481](fbgemm_gpu/src/memory_utils/memory_utils.cu#L481)） |
 | `cudaMemAttachGlobal` / `cudaMemAttachHost` | 限制 UVM 可见范围 | ❌ 未使用（默认 Global） |
 | `__managed__` 编译期变量 | 编译期声明 UVM 变量 | ❌ 未使用 |
 
@@ -168,8 +169,14 @@ gpuMemAdvise(ptr, size_bytes, cudaMemAdviseSetPreferredLocation, cudaCpuDeviceId
 gpuMemAdvise(ptr, size_bytes, cudaMemAdviseSetAccessedBy, current_device);
 //    ↑ 关键：建立 direct mapping 后, GPU 访问不会触发 page fault
 
-// ④ Workaround fork 后 cuda context 不匹配的问题
-madvise(ptr, size_bytes, MADV_DONTFORK);
+// ④ madvise() 系统调用要求 page-aligned, 但 cudaMallocManaged 返回的
+//    ptr/size 不一定 aligned, 所以先调 adjust_to_page_boundaries
+//    把 [ptr, ptr+size) 区间对齐到 OS page 边界
+auto adjusted = adjust_to_page_boundaries(ptr, size_bytes);
+
+// ⑤ 在对齐后的区间上设 MADV_DONTFORK
+//    Workaround fork 后 cuda context 不匹配的问题
+madvise(std::get<0>(adjusted), std::get<1>(adjusted), MADV_DONTFORK);
 ```
 
 源码中的注释原文（`memory_utils.cu:212-227`）：
