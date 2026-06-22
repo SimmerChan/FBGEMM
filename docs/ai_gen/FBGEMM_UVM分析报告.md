@@ -567,6 +567,96 @@ class UVMCacheStatsIndex(enum.IntEnum):
 
 通过 `emb.print_uvm_cache_stats()` / `emb.get_uvm_cache_stats()` / `emb.reset_uvm_cache_stats()` 读取。
 
+#### 3.2.4 MANAGED vs MANAGED_CACHING 的 UVM 依赖差异（2026-06-12 增补）
+
+> **核心问题**：两种模式都用了 UVM，但到底"用了多少"UVM？哪一种对昇腾 950 UVM 能力更敏感？
+
+##### 一句话总结
+
+**两种模式分配方式完全相同**（都走 `cudaMallocManaged`），**唯一差异是 FBGEMM 是否在 HBM 上显式维护一份 cache**。这导致**对 UVM 的依赖程度完全不同**：
+
+- **MANAGED**：**重度依赖 UVM 硬件级 page-fault 机制**
+- **MANAGED_CACHING**：**轻度依赖 UVM**（作为存储后端），miss 处理由 FBGEMM 自管
+
+##### 决策入口：一个参数分两路
+
+[split_table_batched_embeddings_ops_common.py:450-474](fbgemm_gpu/fbgemm_gpu/split_table_batched_embeddings_ops_common.py#L450)
+
+```python
+if cache_load_factor == 0:        return EmbeddingLocation.MANAGED         # 纯 UVM
+elif cache_load_factor == 1.0:    return EmbeddingLocation.DEVICE         # 纯 HBM
+else:                              return EmbeddingLocation.MANAGED_CACHING # UVM + HBM cache
+```
+
+| `cache_load_factor` | 模式 | `lxu_cache_weights` 是否分配 | `use_lxu_cache` |
+|---|---|---|---|
+| `0` | MANAGED | ❌ 不分配（`numel() == 0`） | `false` |
+| `(0, 1)` | MANAGED_CACHING | ✅ 分配（`cache_load_factor × total_rows` 大小） | `true` |
+| `1.0` | DEVICE | ❌ 不分配 | `false`（用 DEVICE HBM） |
+
+##### 同一份 UVM 主存，两条路径
+
+```
+        MANAGED                              MANAGED_CACHING
+  ┌─────────────────────┐              ┌─────────────────────┐
+  │      CPU DRAM       │              │      CPU DRAM       │
+  │  weights_uvm (100%) │              │  weights_uvm (100%) │  ← 完全相同
+  └─────────────────────┘              └─────────────────────┘
+            ↑                                       ↑ ↓
+            │ page fault                          │ ↓ cache populate
+            │ (driver 隐式迁移)                   │ ↓ (FBGEMM 显式)
+            │                                     │ ↓
+  ┌─────────────────────┐              ┌─────────────────────┐
+  │     GPU HBM         │              │     GPU HBM         │
+  │ (driver 自动迁移的   │              │ lxu_cache_weights   │
+  │  hot pages, 不可控) │              │ (FBGEMM 显式 cache, │
+  │                     │              │  cache_load_factor  │
+  │                     │              │  控制大小, LRU/LFU) │
+  └─────────────────────┘              └─────────────────────┘
+        ↖ driver 管                          ↖ FBGEMM 管
+```
+
+##### 5 个维度的差异
+
+| 维度 | MANAGED | MANAGED_CACHING |
+|---|---|---|
+| **内存分配** | `cudaMallocManaged` 分配 `weights_uvm`（[memory_utils.cu:97](fbgemm_gpu/src/memory_utils/memory_utils.cu#L97)） | **完全相同** |
+| **cudaMemAdvise** | `SetPreferredLocation=CPU` + `SetAccessedBy=current_device`（[memory_utils.cu:203-227](fbgemm_gpu/src/memory_utils/memory_utils.cu#L203)） | **完全相同** |
+| **HBM cache buffer** | ❌ 不分配（`lxu_cache_weights.numel() == 0`） | ✅ 显式分配（[training.py:3602-3630](fbgemm_gpu/fbgemm_gpu/split_table_batched_embeddings_ops_training.py#L3602)）：`lxu_cache_state`、`lxu_cache_weights`、`lru_state` |
+| **forward kernel 路径** | `use_lxu_cache = false` → 走 no-cache 路径直读 `weights_uvm`（[embedding_forward_split_template.cu:602-605](fbgemm_gpu/codegen/training/forward/embedding_forward_split_template.cu#L602)） | `use_lxu_cache = true` → 先查 cache，命中走 HBM cache，未命中 fallback UVM |
+| **miss 处理** | **CUDA driver + Linux HMM** 自动 page fault + on-demand migrate（**FBGEMM 不参与**） | **FBGEMM 自管**：`lru_cache_populate` kernel 显式 `warp_cache_evict` + `warp_cache_load`（[lru_cache_populate.cu:17-165](fbgemm_gpu/src/split_embeddings_cache/lru_cache_populate.cu#L17)） |
+
+##### UVM 依赖程度：重度 vs 轻度
+
+| 依赖项 | MANAGED | MANAGED_CACHING |
+|---|---|---|
+| `cudaMallocManaged` | ✅ 必须 | ✅ 必须 |
+| `cudaMemAdvise` | ✅ 必须（性能） | ✅ 必须（性能） |
+| **硬件级 page-fault 自动迁移** | 🔴 **必须** | 🟢 **不必须**（可走显式 memcpy 退化路径） |
+| `cudaMemPrefetchAsync` | ⚠️ 可选（性能） | ⚠️ 可选（性能） |
+| HBM 上的 cache 缓冲 | ❌ 不要 | ✅ 必须 |
+| FBGEMM miss 处理逻辑 | ❌ 没有 | ✅ 必须（`lru_cache_populate` 等 kernel） |
+| 优化器双写 UVM + HBM | ❌ 不需要 | ✅ 必须（[embedding_inplace_update.cu:84-98](fbgemm_gpu/src/embedding_inplace_ops/embedding_inplace_update.cu#L84)） |
+| **总体 UVM 依赖** | **重** | **中** |
+
+**关键洞察**：
+
+- **MANAGED 没有 page-fault 就完全不能工作**。如果 CANN 不支持硬件 page fault 机制：`cudaMallocManaged` 可以模拟（分配在 host memory），但 GPU 访问时没有 fault 机制，访问会直接失败或得到随机数据
+- **MANAGED_CACHING 即使没有 page-fault 也能工作**。退化路径：cache miss → 显式 memcpy（轮询 / Pinned memcpy）→ HBM。FBGEMM 内部走的就是**显式 memcpy**（`warp_cache_load` 是同步拷贝），不依赖 driver fault 机制
+
+##### 对昇腾 950 UVM 移植的启示
+
+| 模式 | 移植风险 | 验收分级 |
+|---|---|---|
+| **MANAGED_CACHING** | 🟢 **P1 中风险** — 只需 `aclrtMallocManaged` + memcpy 访问（显式 `aclrtMemcpyAsync`），对 fault 机制无强依赖 | **P0 必须支持** — 单测 `test/uvm/*` + DLRM benchmark |
+| **MANAGED** | 🔴 **P0 高风险** — 必须依赖硬件 page-fault 自动迁移 | **P1 可选支持** — 仅当 CANN 提供硬件 page-fault 机制后才开启 |
+
+**CANN 实现建议**：
+
+如果 CANN UVM 短期只支持 prefetch API、不支持硬件 page-fault：
+- ✅ **MANAGED_CACHING 可以支持**：kernel miss 时调 `aclrtMemcpyAsync` 从 UVM 池子拷到 HBM cache，性能可接受
+- ❌ **MANAGED 难以支持**：没有 page-fault 机制时，GPU 直接访问 UVM 内存要么 OOM、要么完全失败
+
 ### 3.3 算子-文件对照表
 
 | 算子 / 接口 | 文件 | UVM 形参 / 缓冲 |
