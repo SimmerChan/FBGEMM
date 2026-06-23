@@ -32,7 +32,14 @@ VERBOSITY: Verbosity = Verbosity.verbose
 class LXUCacheTest(unittest.TestCase):
     @unittest.skipIf(*gpu_unavailable)
     @given(
-        associativity=st.sampled_from([1, DEFAULT_ASSOC]),
+        # lxu_cache_lookup is a set-associative lookup whose kernel reads
+        # exactly kWarpSize (== DEFAULT_ASSOC) ways per set. Any other
+        # associativity makes the kernel read past the cache state row
+        # (out of bounds), which on ROCm wavefront64 yields spurious hits.
+        # The direct-mapped (associativity 1) path is a separate op,
+        # direct_mapped_lxu_cache_lookup, exercised end-to-end (cache_assoc=1)
+        # by nbit_cache_test.test_nbit_direct_mapped_uvm_cache_stats.
+        associativity=st.sampled_from([DEFAULT_ASSOC]),
     )
     @settings(deadline=None)
     def test_lxu_cache_lookup(self, associativity: int) -> None:
@@ -112,7 +119,7 @@ class LXUCacheTest(unittest.TestCase):
             low=1,
             high=3,
             size=[cache_sets, warp_size],
-            device="cuda",
+            device=torch.accelerator.current_accelerator(),
             dtype=torch.int32,
         )
         counter_ref = lxu_cache_locking_counter.tolist()
@@ -128,9 +135,15 @@ class LXUCacheTest(unittest.TestCase):
                 q, r = idx // warp_size, idx % warp_size
                 counter_ref[q][r] -= 1
 
-        counter_ref = torch.tensor(counter_ref, device="cuda", dtype=torch.int32)
+        counter_ref = torch.tensor(
+            counter_ref,
+            device=torch.accelerator.current_accelerator(),
+            dtype=torch.int32,
+        )
         lxu_cache_locations = torch.tensor(
-            lxu_cache_locations_list, device="cuda", dtype=torch.int32
+            lxu_cache_locations_list,
+            device=torch.accelerator.current_accelerator(),
+            dtype=torch.int32,
         )
         torch.ops.fbgemm.lxu_cache_locking_counter_decrement(
             lxu_cache_locking_counter, lxu_cache_locations
@@ -306,11 +319,13 @@ class LXUCacheTest(unittest.TestCase):
         lxu_cache_state = torch.zeros(
             cache_sets,
             DEFAULT_ASSOC,
-            device="cuda",
+            device=torch.accelerator.current_accelerator(),
             dtype=torch.int64,
         ).fill_(-1)
 
-        hash_sizes = torch.tensor([E] * T, dtype=torch.long, device="cuda")
+        hash_sizes = torch.tensor(
+            [E] * T, dtype=torch.long, device=torch.accelerator.current_accelerator()
+        )
         cache_hash_size_cumsum = torch.ops.fbgemm.asynchronous_complete_cumsum(
             hash_sizes
         )

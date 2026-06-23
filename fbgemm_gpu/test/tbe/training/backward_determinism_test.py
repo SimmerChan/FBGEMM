@@ -40,7 +40,7 @@ from fbgemm_gpu.tbe.utils import (
     round_up,
     to_device,
 )
-from hypothesis import assume, given, HealthCheck, settings, Verbosity
+from hypothesis import assume, given, settings, Verbosity
 
 from .. import common  # noqa E402
 from ..common import open_source
@@ -57,12 +57,6 @@ else:
 
 
 VERBOSITY: Verbosity = Verbosity.verbose
-
-SUPPRESS_HEALTH_CHECKS: list[HealthCheck] = [
-    HealthCheck.filter_too_much,
-    HealthCheck.data_too_large,
-    HealthCheck.differing_executors,
-]
 
 
 @optests.generate_opcheck_tests(fast=True, additional_decorators=additional_decorators)
@@ -392,7 +386,6 @@ class BackwardDeterminismTest(unittest.TestCase):
         verbosity=VERBOSITY,
         max_examples=20,
         deadline=None,
-        suppress_health_check=SUPPRESS_HEALTH_CHECKS,
     )
     @unittest.skipIf(*gpu_unavailable)
     def test_backward_determinism_sgd(
@@ -447,7 +440,6 @@ class BackwardDeterminismTest(unittest.TestCase):
         verbosity=VERBOSITY,
         max_examples=20,
         deadline=None,
-        suppress_health_check=SUPPRESS_HEALTH_CHECKS,
     )
     @unittest.skipIf(*gpu_unavailable)
     def test_backward_determinism_adagrad(
@@ -506,7 +498,6 @@ class BackwardDeterminismTest(unittest.TestCase):
         verbosity=VERBOSITY,
         max_examples=20,
         deadline=None,
-        suppress_health_check=SUPPRESS_HEALTH_CHECKS,
     )
     @unittest.skipIf(*gpu_unavailable)
     def test_backward_determinism_optimizers(
@@ -582,7 +573,6 @@ class BackwardDeterminismTest(unittest.TestCase):
         verbosity=VERBOSITY,
         max_examples=20,
         deadline=None,
-        suppress_health_check=SUPPRESS_HEALTH_CHECKS,
     )
     @unittest.skipIf(*gpu_unavailable)
     def test_backward_determinism_partial_rowwise_adam(
@@ -642,7 +632,6 @@ class BackwardDeterminismTest(unittest.TestCase):
         verbosity=VERBOSITY,
         max_examples=20,
         deadline=None,
-        suppress_health_check=SUPPRESS_HEALTH_CHECKS,
     )
     @unittest.skipIf(*gpu_unavailable)
     def test_backward_determinism_ensemble(
@@ -705,7 +694,6 @@ class BackwardDeterminismTest(unittest.TestCase):
         verbosity=VERBOSITY,
         max_examples=20,
         deadline=None,
-        suppress_health_check=SUPPRESS_HEALTH_CHECKS,
     )
     @unittest.skipIf(*gpu_unavailable)
     def test_backward_determinism_none(
@@ -754,7 +742,6 @@ class BackwardDeterminismTest(unittest.TestCase):
         verbosity=VERBOSITY,
         max_examples=20,
         deadline=None,
-        suppress_health_check=SUPPRESS_HEALTH_CHECKS,
     )
     @unittest.skipIf(*gpu_unavailable)
     def test_backward_determinism_dense(
@@ -809,7 +796,6 @@ class BackwardDeterminismTest(unittest.TestCase):
         verbosity=VERBOSITY,
         max_examples=10,
         deadline=None,
-        suppress_health_check=SUPPRESS_HEALTH_CHECKS,
     )
     @unittest.skipIf(*gpu_unavailable)
     def test_backward_determinism_long_segments(

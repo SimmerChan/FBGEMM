@@ -31,6 +31,7 @@ if open_source:
         gpu_memory_lt_gb,
         gpu_unavailable,
         on_oss_clang,
+        optests,
     )
 else:
     import fbgemm_gpu.sparse_ops  # noqa: F401, E402
@@ -39,6 +40,7 @@ else:
         gpu_memory_lt_gb,
         gpu_unavailable,
         on_oss_clang,
+        optests,
     )
 
 
@@ -180,6 +182,9 @@ class PermuteIndicesTest(unittest.TestCase):
     )
     @settings(verbosity=Verbosity.verbose, max_examples=20, deadline=None)
     @unittest.skipIf(*gpu_unavailable)
+    @optests.dontGenerateOpCheckTests(
+        "GPU-only test; opcheck variants only skip on CPU samples and add no op coverage (T191384137)"
+    )
     def test_permute_indices_non_contiguous(
         self,
         B: int,
@@ -244,6 +249,9 @@ class PermuteIndicesTest(unittest.TestCase):
     # models returned. So we need to add a unittest to ensure the op return
     # real None, not an undefined tensor.
     @unittest.skipIf(*gpu_unavailable)
+    @optests.dontGenerateOpCheckTests(
+        "GPU-only test; opcheck variants only skip on CPU samples and add no op coverage (T191384137)"
+    )
     def test_permute_indices_scripted_with_none_weights(
         self,
     ) -> None:
@@ -360,6 +368,9 @@ class PermuteIndicesTest(unittest.TestCase):
     )
     @settings(verbosity=Verbosity.verbose, max_examples=100, deadline=None)
     @unittest.skipIf(*gpu_unavailable)
+    @optests.dontGenerateOpCheckTests(
+        "GPU-only test; opcheck variants only skip on CPU samples and add no op coverage (T191384137)"
+    )
     def test_permute_1D_sparse_data_vec(
         self,
         num_segments: int,
@@ -509,6 +520,9 @@ class PermuteIndicesTest(unittest.TestCase):
     )
     @settings(verbosity=Verbosity.verbose, max_examples=50, deadline=None)
     @unittest.skipIf(*gpu_unavailable)
+    @optests.dontGenerateOpCheckTests(
+        "GPU-only test; opcheck variants only skip on CPU samples and add no op coverage (T191384137)"
+    )
     def test_permute_1D_sparse_data_vec_2d_weights(
         self,
         num_segments: int,
@@ -648,6 +662,9 @@ class PermuteIndicesTest(unittest.TestCase):
     )
     @settings(verbosity=Verbosity.verbose, max_examples=10, deadline=None)
     @unittest.skipIf(*gpu_unavailable)
+    @optests.dontGenerateOpCheckTests(
+        "GPU-only test; opcheck variants only skip on CPU samples and add no op coverage (T191384137)"
+    )
     def test_permute_2D_indices_vec_remainder(
         self,
         long_index: bool,
@@ -724,6 +741,9 @@ class PermuteIndicesTest(unittest.TestCase):
     )
     @settings(verbosity=Verbosity.verbose, max_examples=10, deadline=None)
     @unittest.skipIf(*gpu_unavailable)
+    @optests.dontGenerateOpCheckTests(
+        "GPU-only test; opcheck variants only skip on CPU samples and add no op coverage (T191384137)"
+    )
     def test_permute_2D_indices_large_segments(
         self,
         index_dtype: torch.dtype,
@@ -799,6 +819,12 @@ class PermuteIndicesTest(unittest.TestCase):
     # Skip on GPUs with insufficient HBM (need a few hundred MB for the
     # int32 N-element tensors).
     @unittest.skipIf(*gpu_memory_lt_gb(4))
+    # GPU-memory-gated ROCm grid-overflow stress repro: the generated opcheck
+    # variants add no op-schema coverage and only produce SKIPPING test-health
+    # records on CPU/small-GPU runs (T191384137).
+    @optests.dontGenerateOpCheckTests(
+        "large-grid ROCm overflow stress repro; opcheck variants add no coverage"
+    )
     def test_permute_1D_sparse_data_large_grid(self) -> None:
         """
         Reproduces the HIP grid-overflow bug in permute_1D_sparse_data_cuda
@@ -865,6 +891,395 @@ class PermuteIndicesTest(unittest.TestCase):
         torch.testing.assert_close(permuted_lengths_gpu.cpu(), permuted_lengths_cpu)
         torch.testing.assert_close(permuted_indices_gpu.cpu(), permuted_indices_cpu)
         self.assertIsNone(permuted_weights_gpu)
+
+    @unittest.skipIf(*gpu_unavailable)
+    # Skip on GPUs with insufficient HBM (need ~512 MB for the int32
+    # lengths tensor at the chosen B).
+    @unittest.skipIf(*gpu_memory_lt_gb(4))
+    @optests.dontGenerateOpCheckTests(
+        "large-grid ROCm overflow stress repro; opcheck variants add no coverage (T191384137)"
+    )
+    def test_permute_2D_sparse_data_large_grid(self) -> None:
+        """
+        Reproduces the HIP grid-overflow bug in permute_2D_sparse_data_cuda
+        and verifies output correctness at the same scale.
+
+        With BT_blocks=32 and dim3(32, 32) (block size 1024), the
+        permute_2D_data_kernel_vec launch grid is
+        cuda_calc_block_count(B*T, 32). For B*T > 2**27, total threads
+        exceed the HIP 2**32 limit, causing FBGEMM_LAUNCH_KERNEL ->
+        KernelLauncher::checkThreadCountNotExceeded to TORCH_CHECK-fail on
+        ROCm pre-fix. With the production fix in place, this test
+        additionally validates output correctness against the CPU dispatch
+        of the same op — the GPU output must match the CPU reference
+        element-for-element.
+
+        Uses ``T=2, B=2**26+1`` so ``B*T = 2**27 + 2`` strictly trips the
+        threshold. ``lengths`` is sparse: all zero except for four known
+        non-zero positions (one per row, plus one mid-row), so HBM usage
+        stays bounded (~537 MB int32) while the permutation logic is
+        still exercised. ``permute = [1, 0]`` is a deterministic row swap
+        on the T axis with ``perm[i] != i`` for every i, so any
+        "kernel computed identity instead of permutation" or wrong-``b_t``
+        decoding bug surfaces in the assertion below.
+        """
+
+        # Choose B*T so that total threads strictly exceeds 2**32:
+        # cuda_calc_block_count(B*T, 32) * 1024 ~= B*T * 32; need B*T > 2**27.
+        T = 2
+        B = (1 << 26) + 1
+
+        device = torch.device(torch.accelerator.current_accelerator() or "cuda")
+
+        # Deterministic non-identity permute: row swap on the T axis.
+        # perm[0] == 1 and perm[1] == 0, so perm[i] != i for every i.
+        perm_cpu = torch.tensor([1, 0], dtype=torch.int32)
+        permute = perm_cpu.to(device)
+
+        # Sparse non-zero lengths at four known positions. Total = 11.
+        lengths_cpu = torch.zeros((T, B), dtype=torch.int32)
+        lengths_cpu[0, 0] = 3
+        lengths_cpu[0, B // 2] = 5
+        lengths_cpu[1, 0] = 2
+        lengths_cpu[1, B - 1] = 1
+        lengths = lengths_cpu.to(device)
+
+        # Distinct indices per segment so the permutation is fully observable.
+        indices_cpu = torch.arange(11, dtype=torch.int32)
+        indices = indices_cpu.to(device)
+
+        # CPU reference oracle — same op, different dispatch.
+        (
+            permuted_lengths_cpu,
+            permuted_indices_cpu,
+            _permuted_weights_cpu,
+        ) = torch.ops.fbgemm.permute_2D_sparse_data(
+            perm_cpu, lengths_cpu, indices_cpu, None, None
+        )
+
+        # GPU op under test. Pre-fix, this launch trips
+        # KernelLauncher::checkThreadCountNotExceeded on ROCm.
+        (
+            permuted_lengths_gpu,
+            permuted_indices_gpu,
+            permuted_weights_gpu,
+        ) = torch.ops.fbgemm.permute_2D_sparse_data(
+            permute, lengths, indices, None, None
+        )
+
+        torch.testing.assert_close(permuted_lengths_gpu.cpu(), permuted_lengths_cpu)
+        torch.testing.assert_close(permuted_indices_gpu.cpu(), permuted_indices_cpu)
+        self.assertIsNone(permuted_weights_gpu)
+
+    @unittest.skipIf(*gpu_unavailable)
+    # Skip on GPUs with insufficient HBM (need ~512 MB for the int32
+    # lengths tensor at the chosen B).
+    @unittest.skipIf(*gpu_memory_lt_gb(4))
+    @optests.dontGenerateOpCheckTests(
+        "large-grid ROCm overflow stress repro; opcheck variants add no coverage (T191384137)"
+    )
+    def test_permute_sparse_features_large_grid(self) -> None:
+        """
+        Reproduces the HIP grid-overflow bug in permute_sparse_features_cuda
+        and verifies output correctness at the same scale.
+
+        With BT_blocks=32 and dim3(32, 32) (block size 1024), the
+        permute_indices_weights_kernel launch grid is
+        cuda_calc_block_count(B*T, 32). For B*T > 2**27, total threads
+        exceed the HIP 2**32 limit, causing FBGEMM_LAUNCH_KERNEL ->
+        KernelLauncher::checkThreadCountNotExceeded to TORCH_CHECK-fail on
+        ROCm pre-fix. With the production fix in place, this test
+        additionally validates output correctness against the CPU dispatch
+        of the same op — the GPU output must match the CPU reference
+        element-for-element.
+
+        Uses ``T=2, B=2**26+1`` so ``B*T = 2**27 + 2`` strictly trips the
+        threshold. ``lengths`` is sparse: all zero except for four known
+        non-zero positions (one per row, plus one mid-row), so HBM usage
+        stays bounded (~537 MB int32) while the permutation logic is
+        still exercised. ``permute = [1, 0]`` is a deterministic row swap
+        on the T axis with ``perm[i] != i`` for every i, so any
+        "kernel computed identity instead of permutation" or wrong-``b_t``
+        decoding bug surfaces in the assertion below.
+        """
+
+        # Choose B*T so that total threads strictly exceeds 2**32:
+        # cuda_calc_block_count(B*T, 32) * 1024 ~= B*T * 32; need B*T > 2**27.
+        T = 2
+        B = (1 << 26) + 1
+
+        device = torch.device(torch.accelerator.current_accelerator() or "cuda")
+
+        # Deterministic non-identity permute: row swap on the T axis.
+        # perm[0] == 1 and perm[1] == 0, so perm[i] != i for every i.
+        perm_cpu = torch.tensor([1, 0], dtype=torch.int32)
+        permute = perm_cpu.to(device)
+
+        # Sparse non-zero lengths at four known positions. Total = 11.
+        lengths_cpu = torch.zeros((T, B), dtype=torch.int32)
+        lengths_cpu[0, 0] = 3
+        lengths_cpu[0, B // 2] = 5
+        lengths_cpu[1, 0] = 2
+        lengths_cpu[1, B - 1] = 1
+        lengths = lengths_cpu.to(device)
+
+        # Distinct indices per segment so the permutation is fully observable.
+        indices_cpu = torch.arange(11, dtype=torch.int32)
+        indices = indices_cpu.to(device)
+
+        # CPU reference oracle — same op, different dispatch.
+        (
+            permuted_lengths_cpu,
+            permuted_indices_cpu,
+            _permuted_weights_cpu,
+        ) = torch.ops.fbgemm.permute_sparse_features(
+            perm_cpu, lengths_cpu, indices_cpu, None
+        )
+
+        # GPU op under test. Pre-fix, this launch trips
+        # KernelLauncher::checkThreadCountNotExceeded on ROCm.
+        (
+            permuted_lengths_gpu,
+            permuted_indices_gpu,
+            permuted_weights_gpu,
+        ) = torch.ops.fbgemm.permute_sparse_features(permute, lengths, indices, None)
+
+        torch.testing.assert_close(permuted_lengths_gpu.cpu(), permuted_lengths_cpu)
+        torch.testing.assert_close(permuted_indices_gpu.cpu(), permuted_indices_cpu)
+        self.assertIsNone(permuted_weights_gpu)
+
+    @given(
+        B=st.integers(min_value=1, max_value=20),
+        T=st.integers(min_value=1, max_value=20),
+        L=st.integers(min_value=2, max_value=20),
+        long_index=st.booleans(),
+        has_weight=st.booleans(),
+    )
+    @settings(verbosity=Verbosity.verbose, max_examples=20, deadline=None)
+    def test_permute_indices_with_preallocated_output(
+        self,
+        B: int,
+        T: int,
+        L: int,
+        long_index: bool,
+        has_weight: bool,
+    ) -> None:
+        """
+        Test permute_2D_sparse_preallocated_out with pre-allocated output tensors.
+
+        Verifies that passing pre-allocated output buffers via the optional
+        permuted_lengths_out, permuted_indices_out, and permuted_weights_out
+        parameters produces the same results as the default allocation path
+        (permute_2D_sparse_data), and that the returned tensors share storage
+        with the pre-allocated buffers.
+        """
+        index_dtype = torch.int64 if long_index else torch.int32
+        lengths = torch.randint(low=1, high=L, size=(T, B)).type(index_dtype)
+        total = int(lengths.sum().item())
+        weights = torch.rand(total).float() if has_weight else None
+        indices = torch.randint(
+            low=1,
+            high=int(1e5),
+            size=(total,),
+        ).type(index_dtype)
+
+        permute_list = list(range(T))
+        random.shuffle(permute_list)
+        permute = torch.IntTensor(permute_list)
+
+        # Reference: default allocation path (no pre-allocated outputs)
+        (
+            permuted_lengths_ref,
+            permuted_indices_ref,
+            permuted_weights_ref,
+        ) = torch.ops.fbgemm.permute_2D_sparse_data(
+            permute, lengths, indices, weights, None
+        )
+
+        # Pre-allocate output tensors on CPU
+        permuted_lengths_out = torch.empty(T, B, dtype=index_dtype)
+        permuted_indices_out = torch.empty(total, dtype=index_dtype)
+        permuted_weights_out = (
+            torch.empty(total, dtype=torch.float) if has_weight else None
+        )
+
+        (
+            permuted_lengths_cpu,
+            permuted_indices_cpu,
+            permuted_weights_cpu,
+        ) = torch.ops.fbgemm.permute_2D_sparse_preallocated_out(
+            permute,
+            lengths,
+            indices,
+            weights,
+            None,
+            permuted_lengths_out,
+            permuted_indices_out,
+            permuted_weights_out,
+        )
+
+        # Verify correctness
+        torch.testing.assert_close(permuted_lengths_cpu, permuted_lengths_ref)
+        torch.testing.assert_close(permuted_indices_cpu, permuted_indices_ref)
+        if has_weight:
+            torch.testing.assert_close(permuted_weights_cpu, permuted_weights_ref)
+        else:
+            self.assertIsNone(permuted_weights_cpu)
+
+        # Verify returned tensors share storage with pre-allocated buffers
+        self.assertTrue(
+            permuted_lengths_cpu.data_ptr() == permuted_lengths_out.data_ptr()
+        )
+        self.assertTrue(
+            permuted_indices_cpu.data_ptr() == permuted_indices_out.data_ptr()
+        )
+        if has_weight:
+            self.assertIsNotNone(permuted_weights_cpu)
+            # pyre-ignore[16]
+            self.assertTrue(
+                permuted_weights_cpu.data_ptr()
+                # pyre-ignore[16]
+                == permuted_weights_out.data_ptr()
+            )
+
+        # GPU test
+        if gpu_available:
+            weights_cuda = (
+                weights.cuda() if (has_weight and weights is not None) else None
+            )
+            permuted_lengths_out_gpu = torch.empty(
+                T, B, dtype=index_dtype, device=torch.accelerator.current_accelerator()
+            )
+            permuted_indices_out_gpu = torch.empty(
+                total, dtype=index_dtype, device=torch.accelerator.current_accelerator()
+            )
+            permuted_weights_out_gpu = (
+                torch.empty(
+                    total,
+                    dtype=torch.float,
+                    device=torch.accelerator.current_accelerator(),
+                )
+                if has_weight
+                else None
+            )
+
+            (
+                permuted_lengths_gpu,
+                permuted_indices_gpu,
+                permuted_weights_gpu,
+            ) = torch.ops.fbgemm.permute_2D_sparse_preallocated_out(
+                permute.cuda(),
+                lengths.cuda(),
+                indices.cuda(),
+                weights_cuda,
+                None,
+                permuted_lengths_out_gpu,
+                permuted_indices_out_gpu,
+                permuted_weights_out_gpu,
+            )
+
+            # Verify correctness
+            torch.testing.assert_close(permuted_lengths_gpu.cpu(), permuted_lengths_ref)
+            torch.testing.assert_close(permuted_indices_gpu.cpu(), permuted_indices_ref)
+            if has_weight:
+                torch.testing.assert_close(
+                    permuted_weights_gpu.cpu(), permuted_weights_ref
+                )
+            else:
+                self.assertIsNone(permuted_weights_gpu)
+
+            # Verify returned tensors share storage with pre-allocated buffers
+            self.assertTrue(
+                permuted_lengths_gpu.data_ptr() == permuted_lengths_out_gpu.data_ptr()
+            )
+            self.assertTrue(
+                permuted_indices_gpu.data_ptr() == permuted_indices_out_gpu.data_ptr()
+            )
+            if has_weight:
+                self.assertIsNotNone(permuted_weights_gpu)
+                # pyre-ignore[16]
+                self.assertTrue(
+                    permuted_weights_gpu.data_ptr()
+                    # pyre-ignore[16]
+                    == permuted_weights_out_gpu.data_ptr()
+                )
+
+    @given(
+        B=st.integers(min_value=1, max_value=20),
+        T=st.integers(min_value=1, max_value=20),
+        L=st.integers(min_value=2, max_value=20),
+        long_index=st.booleans(),
+    )
+    @settings(verbosity=Verbosity.verbose, max_examples=20, deadline=None)
+    def test_permute_indices_backward(
+        self,
+        B: int,
+        T: int,
+        L: int,
+        long_index: bool,
+    ) -> None:
+        """
+        Verify autograd flows through permute_2D_sparse_data to the float
+        `weights` input on both CPU and GPU.
+
+        The op is a per-feature segment permutation, i.e. linear in `weights`,
+        so the gradient w.r.t. `weights` is the inverse permutation applied to
+        the upstream gradient. The expected gradient is computed independently
+        via permute_indices_ref_ with the inverse permute (not via the op's own
+        registered backward), so this also guards the wrapper refactor that
+        routes permute_2D_sparse_data through the shared implementation.
+        """
+        index_dtype = torch.int64 if long_index else torch.int32
+        lengths: torch.Tensor = torch.randint(low=1, high=L, size=(T, B)).type(
+            index_dtype
+        )
+        total: int = int(lengths.sum().item())
+        indices: torch.Tensor = torch.randint(low=1, high=int(1e5), size=(total,)).type(
+            index_dtype
+        )
+
+        permute_list = list(range(T))
+        random.shuffle(permute_list)
+        permute: torch.Tensor = torch.IntTensor(permute_list)
+
+        # Independent inverse permutation (not torch.ops.fbgemm.invert_permute).
+        inv_permute: torch.Tensor = torch.empty_like(permute)
+        inv_permute[permute.long()] = torch.arange(T, dtype=permute.dtype)
+
+        def check(device: str) -> None:
+            weights = torch.rand(
+                total, dtype=torch.float, device=device, requires_grad=True
+            )
+            (
+                permuted_lengths,
+                permuted_indices,
+                permuted_weights,
+            ) = torch.ops.fbgemm.permute_2D_sparse_data(
+                permute.to(device),
+                lengths.to(device),
+                indices.to(device),
+                weights,
+                None,
+            )
+            upstream = torch.rand_like(permuted_weights)
+            permuted_weights.backward(upstream)
+
+            # Reference grad: inverse-permute the upstream gradient back to the
+            # original `weights` layout.
+            _, _, expected_grad = permute_indices_ref_(
+                permuted_lengths.cpu(),
+                permuted_indices.cpu(),
+                upstream.cpu(),
+                # pyre-ignore[6]
+                inv_permute.long(),
+            )
+            self.assertIsNotNone(weights.grad)
+            # pyre-ignore[16]
+            torch.testing.assert_close(weights.grad.cpu(), expected_grad)
+
+        check("cpu")
+        if gpu_available:
+            check("cuda")
 
 
 extend_test_class(PermuteIndicesTest)

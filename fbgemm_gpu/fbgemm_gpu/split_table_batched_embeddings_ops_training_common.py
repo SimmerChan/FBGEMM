@@ -9,13 +9,31 @@
 
 
 import torch  # usort:skip
+from typing import cast
 from torch import Tensor  # usort:skip
 from torch.compiler import is_compiling as is_torchdynamo_compiling  # usort:skip
 
 # @manual=//deeplearning/fbgemm/fbgemm_gpu/codegen:split_embedding_codegen_lookup_invokers
 import fbgemm_gpu.split_embedding_codegen_lookup_invokers as invokers
-from fbgemm_gpu.split_embedding_configs import sparse_type_int_to_dtype
-from fbgemm_gpu.split_table_batched_embeddings_ops_common import PoolingMode
+
+try:
+    from fbgemm_gpu.split_embedding_configs import sparse_type_int_to_dtype
+except ImportError:
+    # Forward-compat shim for frozen torch.package depots whose stale, co-packaged
+    # copy of split_embedding_configs.py predates D79869613 and therefore does not
+    # export sparse_type_int_to_dtype. The leaf import above is the primary path on
+    # trunk (post-D107684316); this fallback only triggers when this module is
+    # captured fresh alongside a stale split_embedding_configs.py inside a frozen
+    # package, keeping module load from failing with an ImportError. It simply
+    # delegates to SparseType (which the stale module does export), so it stays
+    # correct without re-encoding the SparseType -> dtype mapping.
+    from fbgemm_gpu.split_embedding_configs import SparseType
+
+    def sparse_type_int_to_dtype(ty: int) -> torch.dtype:
+        return SparseType.from_int(ty).as_dtype()
+
+
+from fbgemm_gpu.tbe.config.embedding_config import PoolingMode
 
 
 def generate_vbe_metadata(
@@ -56,7 +74,7 @@ def generate_vbe_metadata(
 
         max_B = total_batch_size_per_feature.max().item()
         if not torch.jit.is_scripting() and is_torchdynamo_compiling():
-            torch._check_is_size(max_B)
+            torch._check_is_size(cast(int, max_B))
             torch._check(max_B < offsets.numel())
 
         Bs = torch.concat([zero_tensor, total_batch_size_per_feature])
@@ -70,7 +88,7 @@ def generate_vbe_metadata(
         )
         max_B_feature_rank = B_feature_rank.max().item()
         if not torch.jit.is_scripting() and is_torchdynamo_compiling():
-            torch._check_is_size(max_B_feature_rank)
+            torch._check_is_size(cast(int, max_B_feature_rank))
             torch._check(max_B_feature_rank <= offsets.size(0))
         output_sizes_feature_rank = B_feature_rank.transpose(
             0, 1
@@ -83,7 +101,7 @@ def generate_vbe_metadata(
         )
         output_size = output_offsets_feature_rank[-1].item()
         if not torch.jit.is_scripting() and is_torchdynamo_compiling():
-            torch._check_is_size(output_size)
+            torch._check_is_size(cast(int, output_size))
 
         # TODO: Support INT8 output
         # B_offsets_rank_per_feature is for rank and (b, t) mapping

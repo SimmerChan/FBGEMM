@@ -8,6 +8,7 @@
 
 import inspect
 import os
+import random
 import subprocess
 import unittest
 from collections.abc import Callable, Generator
@@ -18,13 +19,26 @@ from typing import Any
 import fbgemm_gpu
 import hypothesis.strategies as st
 import torch
-from hypothesis import settings
+from hypothesis import HealthCheck, settings
 
-settings.register_profile("derandomize", derandomize=True)
+_suppressed_health_checks: list[HealthCheck] = [
+    HealthCheck.filter_too_much,
+    HealthCheck.data_too_large,
+] + (
+    [HealthCheck.differing_executors]
+    if getattr(HealthCheck, "differing_executors", False)
+    else []
+)
+
+settings.register_profile(
+    "derandomize", derandomize=True, suppress_health_check=_suppressed_health_checks
+)
 settings.load_profile("derandomize")
 
 
-TEST_WITH_ROCM: bool = os.getenv("FBGEMM_TEST_WITH_ROCM", "0") == "1"
+TEST_WITH_ROCM: bool = os.getenv("FBGEMM_TEST_WITH_ROCM", "0") == "1" or (
+    torch.version.hip is not None and torch.cuda.is_available()
+)
 
 # Skip pt2 compliant tag test for certain operators
 # TODO: remove this once the operators are pt2 compliant
@@ -66,6 +80,27 @@ running_in_oss: tuple[bool, str] = (
     "Test is currently known to fail in OSS mode",
 )
 
+
+def seed_all(seed: int = 0) -> None:
+    """Seed all RNGs used by FBGEMM tests for deterministic behavior.
+
+    Many legacy tests draw split points / weights / indices from global RNGs
+    inside the test body (not via Hypothesis), which makes Hypothesis-recorded
+    failures non-reproducible and the tests flaky. Call this in ``setUp`` (or at
+    the top of a test) to make those draws deterministic.
+    """
+    random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+    try:
+        import numpy as np
+
+        np.random.seed(seed)
+    except ImportError:
+        pass
+
+
 running_on_rocm: tuple[bool, str] = (
     TEST_WITH_ROCM,
     "Test currently doesn't work on the ROCm stack",
@@ -98,9 +133,10 @@ def cpu_and_maybe_gpu() -> st.SearchStrategy[list[torch.device]]:
     # If st.sampled_from contains >100 items or if it's used in conjunction with other strategies
     # then it may not test all values; however, for smaller tests it may work fine.
     # This is still a stopgap solution until we figure out a way to parameterize UnitTestCase.
-    return st.sampled_from(
-        [torch.device("cpu")] + ([torch.device("cuda")] if gpu_available else [])
-    )
+    # lint-fixme: TorchDeviceCuda, TorchFunctionCallCudaDevice
+    # CUDA specifically required: GPU device strategy for FBGEMM tests
+    gpu_devices = [torch.device("cuda")] if gpu_available else []
+    return st.sampled_from([torch.device("cpu")] + gpu_devices)
 
 
 class optests:

@@ -40,7 +40,7 @@ from fbgemm_gpu.tbe.utils import (
     quantize_embs,
     round_up,
 )
-from hypothesis import assume, given, HealthCheck, settings, Verbosity
+from hypothesis import assume, given, settings, Verbosity
 
 from ..common import MAX_EXAMPLES, MAX_EXAMPLES_LONG_RUNNING, open_source
 from .common import get_nbit_weights_ty, NBitFowardTestCommon
@@ -53,6 +53,22 @@ else:
 
 
 VERBOSITY: Verbosity = Verbosity.verbose
+
+
+# Cases for ``test_nbit_forward_nan_zero_fill``. Each tuple is
+# (name, weights_ty, D, output_dtype, weighted). The axes are chosen to
+# exercise the async global->shared-memory zero-fill path added in D91496421
+# (cp.async on CUDA sm80+; global_load_lds on ROCm gfx950/MI350):
+#   - weighted=True also covers the indice-weights zero-fill branch
+#   - weights_ty changes bytes-per-row => NumUint4LoadsPerRow
+#   - large D forces >1 uint4 load per row (multi-iteration row-load loop)
+NAN_ZERO_FILL_CASES: list[tuple[str, SparseType, int, SparseType, bool]] = [
+    ("int4_small_weighted", SparseType.INT4, 160, SparseType.FP16, True),
+    ("int4_small_unweighted", SparseType.INT4, 160, SparseType.FP16, False),
+    ("int4_large_weighted", SparseType.INT4, 1024, SparseType.FP16, True),
+    ("int8_large_unweighted", SparseType.INT8, 1024, SparseType.FP16, False),
+    ("fp16_large_weighted", SparseType.FP16, 2048, SparseType.FP16, True),
+]
 
 
 # pyre-ignore
@@ -124,6 +140,9 @@ additional_decorators: dict[str, list[Callable[..., Any]]] = {
         ),
     ],
     "test_faketensor__test_nbit_forward_fused_pooled_emb_quant_nan_weighted": [
+        unittest.skip("Operator not implemented for fake tensors"),
+    ],
+    "test_faketensor__test_nbit_forward_nan_zero_fill": [
         unittest.skip("Operator not implemented for fake tensors"),
     ],
 }
@@ -356,7 +375,6 @@ class NBitFowardTest(NBitFowardTestCommon):
         verbosity=VERBOSITY,
         max_examples=MAX_EXAMPLES_LONG_RUNNING,
         deadline=None,
-        suppress_health_check=[HealthCheck.filter_too_much],
     )
     def test_nbit_forward_fused_pooled_emb_quant_against_ref(
         self,
@@ -457,6 +475,108 @@ class NBitFowardTest(NBitFowardTestCommon):
         # Expect the outputs to be bit-wise equivalent
         assert torch.equal(output_ref, output)
 
+    def _execute_nan_zero_fill(
+        self,
+        weights_ty: SparseType,
+        D: int,
+        output_dtype: SparseType,
+        weighted: bool,
+    ) -> None:
+        device = torch.cuda.current_device()
+        E = 100
+        D_alignment = (
+            1 if weights_ty.bit_rate() % 8 == 0 else int(8 / weights_ty.bit_rate())
+        )
+        D = round_up(D, D_alignment)
+
+        op = IntNBitTableBatchedEmbeddingBagsCodegen(
+            embedding_specs=[("", E, D, weights_ty, EmbeddingLocation.DEVICE)],
+            output_dtype=output_dtype,
+            pooling_mode=PoolingMode.SUM,
+            device=device,
+        )
+        op.fill_random_weights()
+
+        # Overwrite every row with 1.0 (dequant of 1.0 is exact for these types).
+        quant_weights, quant_scale_shift = quantize_embs(torch.ones(E, D), weights_ty)
+        weights, scale_shift = op.split_embedding_weights()[0]
+        weights.copy_(quant_weights)
+        if quant_scale_shift is not None:
+            self.assertIsNotNone(scale_shift)
+            scale_shift.copy_(quant_scale_shift)
+
+        # Ragged bag lengths: include values not divisible by kRowUnroll (=4)
+        # and a long tail, so padding rows (input_row_idx >= Ls[i]) drive the
+        # predicate false in addition to pruning.
+        Ls = [1, 3, 4, 7, 8, 11, 63, 64]
+        B = len(Ls)
+        total = sum(Ls)
+        offsets = torch.tensor([0, *np.cumsum(Ls)], dtype=torch.int, device=device)
+        indices = torch.randint(0, E, (total,), dtype=torch.int, device=device)
+        per_sample_weights = (
+            torch.arange(total, dtype=torch.float, device=device) if weighted else None
+        )
+
+        # Prune every 3rd position to -1 (idx == -1 => predicate false).
+        prune_mask = torch.arange(total) % 3 == 0
+        pruned_indices = indices.clone()
+        pruned_indices[prune_mask.to(device)] = -1
+
+        # Analytic expected output: per bag, every dim is identical.
+        kept = (~prune_mask).float()
+        if weighted:
+            assert per_sample_weights is not None
+            contrib = per_sample_weights.cpu() * kept
+        else:
+            contrib = kept
+        expected = torch.zeros(B, D, dtype=torch.float)
+        for b in range(B):
+            start, end = int(offsets[b]), int(offsets[b + 1])
+            expected[b, :] = contrib[start:end].sum()
+
+        # Poison shared memory so a missed zero-fill surfaces as a NaN.
+        torch.ops.fbgemm.initialize_nan_shared_mem(device)
+        output = op(
+            indices=pruned_indices,
+            offsets=offsets,
+            per_sample_weights=per_sample_weights,
+        )
+
+        torch.testing.assert_close(
+            output.float().cpu(),
+            expected,
+            atol=1.0e-2,
+            rtol=1.0e-2,
+            equal_nan=False,  # NaN leak from a broken zero-fill must fail
+        )
+
+    @unittest.skipIf(*gpu_unavailable)
+    def test_nbit_forward_nan_zero_fill(self) -> None:
+        """Verify async global->shared-memory zero-fill (D91496421) for predicate-false rows.
+
+        Every embedding row is set to 1.0, so a SUM bag has an analytic value
+        that is independent of the kernel: the count of non-pruned indices
+        (unweighted) or the sum of per-sample weights at non-pruned positions
+        (weighted). Shared memory is pre-poisoned with NaNs, so if the zero-fill
+        path (pred_guard=false for pruned idx==-1 and for padding rows where
+        input_row_idx >= Ls[i]) fails to write zeros, the NaNs leak into the
+        output and break the comparison (equal_nan=False).
+
+        Cases are run in a deterministic loop (not ``parameterized``) because
+        the test target uses static listing, which rejects runtime-generated
+        tests.
+
+        The test itself is hardware agnostic and passes on any GPU. The real
+        async path is compiled on CUDA sm80+ (cp.async); on all other NVIDIA
+        and AMD hardware it falls back to a behavior-identical synchronous
+        copy. NOTE (MI350-specific): on ROCm the async path is compiled only on
+        gfx950/MI350 (global_load_lds) -- other AMD GPUs (e.g. gfx942/MI300)
+        take the synchronous fallback.
+        """
+        for name, weights_ty, D, output_dtype, weighted in NAN_ZERO_FILL_CASES:
+            with self.subTest(case=name):
+                self._execute_nan_zero_fill(weights_ty, D, output_dtype, weighted)
+
     @unittest.skipIf(*gpu_unavailable)
     @given(
         T=st.integers(min_value=1, max_value=10),
@@ -498,7 +618,6 @@ class NBitFowardTest(NBitFowardTestCommon):
         verbosity=VERBOSITY,
         max_examples=MAX_EXAMPLES_LONG_RUNNING,
         deadline=None,
-        suppress_health_check=[HealthCheck.filter_too_much],
     )
     def test_nbit_forward_fused_pooled_emb_quant(
         self,
@@ -821,11 +940,6 @@ class NBitFowardTest(NBitFowardTestCommon):
         max_examples=MAX_EXAMPLES,
         deadline=None,
         # `optests.generate_opcheck_tests` wraps this method with multiple
-        # opcheck variants (faketensor / schema / autograd / aot_dispatch_*),
-        # which Hypothesis sees as differing executors. Suppress the resulting
-        # health check — see precedent in
-        # `fbgemm_gpu/test/tbe/training/backward_determinism_test.py`.
-        suppress_health_check=[HealthCheck.differing_executors],
     )
     def test_nbit_forward_gpu_no_cache_nobag_aligned_D(
         self,

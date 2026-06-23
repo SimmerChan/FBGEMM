@@ -184,12 +184,15 @@ __global__ __launch_bounds__(kMaxThreads) void permute_2D_lengths_kernel(
 }
 
 DLL_PUBLIC std::tuple<Tensor, Tensor, std::optional<Tensor>>
-permute_2D_sparse_data_cuda(
+permute_2D_sparse_preallocated_out_cuda(
     const Tensor& permute,
     const Tensor& lengths,
     const Tensor& indices,
     const std::optional<Tensor>& weights,
-    const std::optional<int64_t>& permuted_lengths_sum) {
+    const std::optional<int64_t>& permuted_lengths_sum,
+    const std::optional<Tensor>& permuted_lengths_out,
+    const std::optional<Tensor>& permuted_indices_out,
+    const std::optional<Tensor>& permuted_weights_out) {
   TENSORS_ON_SAME_CUDA_GPU_IF_NOT_OPTIONAL(permute, lengths, indices, weights);
   TORCH_CHECK(lengths.dim() == 2);
 
@@ -218,10 +221,17 @@ permute_2D_sparse_data_cuda(
   Tensor permuted_indices;
   Tensor permuted_weights;
 
-  permuted_lengths = at::empty({T, B}, lengths.options());
+  permuted_lengths = permuted_lengths_out.has_value()
+      ? permuted_lengths_out.value()
+      : at::empty({T, B}, lengths.options());
 
   constexpr int32_t threads_1 = 256;
-  const auto blocks_1 = cuda_calc_block_count(B * T, threads_1);
+  // HIP enforces a hard limit of 2^32 total threads per launch (unlike CUDA,
+  // which silently wraps). permute_2D_lengths_kernel uses CUDA_KERNEL_LOOP,
+  // which already grid-strides, so capping is correctness-preserving.
+  // See: https://github.com/ROCm/hip/issues/2253
+  const auto blocks_1 = utils::cuda::cap_grid_dim_x_from_workload(
+      B * T, threads_1, at::cuda::getCurrentCUDAStream());
   AT_DISPATCH_INDEX_TYPES(
       lengths.scalar_type(), "permute_2D_lengths_kernel", [&] {
         FBGEMM_LAUNCH_KERNEL(
@@ -250,8 +260,18 @@ permute_2D_sparse_data_cuda(
 
   constexpr int32_t BT_blocks = 32;
   dim3 threads_2(32, BT_blocks);
-  const auto blocks_2 = cuda_calc_block_count(B * T, BT_blocks);
-  permuted_indices = at::empty(permuted_indices_size, indices.options());
+  // HIP enforces a hard limit of 2^32 total threads per launch (unlike CUDA,
+  // which silently wraps). Both permute_2D_data_kernel and
+  // permute_2D_data_kernel_vec grid-stride over b_t, so capping is
+  // correctness-preserving.
+  // See: https://github.com/ROCm/hip/issues/2253
+  const auto blocks_2 = utils::cuda::cap_grid_dim_x(
+      cuda_calc_xblock_count(B * T, BT_blocks),
+      BT_blocks * 32,
+      at::cuda::getCurrentCUDAStream());
+  permuted_indices = permuted_indices_out.has_value()
+      ? permuted_indices_out.value()
+      : at::empty(permuted_indices_size, indices.options());
 
   AT_DISPATCH_INDEX_TYPES(
       input_offsets.scalar_type(), "permute_2D_data_kernel_1", [&] {
@@ -265,12 +285,16 @@ permute_2D_sparse_data_cuda(
                 int32_t weights_columns = 1;
                 if (weights_value.dense_dim() > 1) {
                   weights_columns = weights_value.size(1);
-                  permuted_weights = at::empty(
-                      {permuted_indices_size, weights_columns},
-                      weights_value.options());
+                  permuted_weights = permuted_weights_out.has_value()
+                      ? permuted_weights_out.value()
+                      : at::empty(
+                            {permuted_indices_size, weights_columns},
+                            weights_value.options());
                 } else {
-                  permuted_weights =
-                      at::empty(permuted_indices_size, weights_value.options());
+                  permuted_weights = permuted_weights_out.has_value()
+                      ? permuted_weights_out.value()
+                      : at::empty(
+                            permuted_indices_size, weights_value.options());
                 }
                 FBGEMM_DISPATCH_ALL_TYPES_AND_DOUBLE(
                     weights_value.scalar_type(),
@@ -349,6 +373,26 @@ permute_2D_sparse_data_cuda(
   return {permuted_lengths, permuted_indices, permuted_weights};
 }
 
+// Functional (allocating) entry point. Delegates to the shared implementation
+// with no pre-allocated output buffers.
+DLL_PUBLIC std::tuple<Tensor, Tensor, std::optional<Tensor>>
+permute_2D_sparse_data_cuda(
+    const Tensor& permute,
+    const Tensor& lengths,
+    const Tensor& indices,
+    const std::optional<Tensor>& weights,
+    const std::optional<int64_t>& permuted_lengths_sum) {
+  return permute_2D_sparse_preallocated_out_cuda(
+      permute,
+      lengths,
+      indices,
+      weights,
+      permuted_lengths_sum,
+      std::nullopt,
+      std::nullopt,
+      std::nullopt);
+}
+
 // Kernel for permuting the indices and weights. Used for permutation of
 // sparse features
 template <bool has_weight, typename index_t, typename scalar_t>
@@ -415,8 +459,12 @@ permute_sparse_features_cuda(
   permuted_lengths = at::empty({num_output_features, B}, lengths.options());
 
   constexpr int32_t threads_1 = 256;
-  const auto blocks_1 =
-      cuda_calc_block_count(B * num_output_features, threads_1);
+  // HIP enforces a hard limit of 2^32 total threads per launch (unlike CUDA,
+  // which silently wraps). permute_2D_lengths_kernel uses CUDA_KERNEL_LOOP,
+  // which already grid-strides, so capping is correctness-preserving.
+  // See: https://github.com/ROCm/hip/issues/2253
+  const auto blocks_1 = utils::cuda::cap_grid_dim_x_from_workload(
+      B * num_output_features, threads_1, at::cuda::getCurrentCUDAStream());
   AT_DISPATCH_INDEX_TYPES(
       lengths.scalar_type(), "permute_2D_lengths_kernel", [&] {
         FBGEMM_LAUNCH_KERNEL(
@@ -452,8 +500,14 @@ permute_sparse_features_cuda(
 
   constexpr int32_t BT_blocks = 32;
   dim3 threads_2(32, BT_blocks);
-  const auto blocks_2 =
-      cuda_calc_block_count(B * num_output_features, BT_blocks);
+  // HIP enforces a hard limit of 2^32 total threads per launch (unlike CUDA,
+  // which silently wraps). permute_indices_weights_kernel grid-strides over
+  // b_t, so capping is correctness-preserving.
+  // See: https://github.com/ROCm/hip/issues/2253
+  const auto blocks_2 = utils::cuda::cap_grid_dim_x(
+      cuda_calc_xblock_count(B * num_output_features, BT_blocks),
+      BT_blocks * 32,
+      at::cuda::getCurrentCUDAStream());
   permuted_indices = at::empty(permuted_lengths_sum, indices.options());
   if (weights.has_value()) {
     const Tensor weights_value = weights.value();
@@ -534,6 +588,10 @@ FBGEMM_OP_DISPATCH(
     CUDA,
     "permute_2D_sparse_data",
     fbgemm_gpu::permute_2D_sparse_data_cuda);
+FBGEMM_OP_DISPATCH(
+    CUDA,
+    "permute_2D_sparse_preallocated_out",
+    fbgemm_gpu::permute_2D_sparse_preallocated_out_cuda);
 FBGEMM_OP_DISPATCH(
     CUDA,
     "permute_2D_sparse_data_input1D",
