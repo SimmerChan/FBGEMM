@@ -657,6 +657,156 @@ else:                              return EmbeddingLocation.MANAGED_CACHING # UV
 - ✅ **MANAGED_CACHING 可以支持**：kernel miss 时调 `aclrtMemcpyAsync` 从 UVM 池子拷到 HBM cache，性能可接受
 - ❌ **MANAGED 难以支持**：没有 page-fault 机制时，GPU 直接访问 UVM 内存要么 OOM、要么完全失败
 
+#### 3.2.5 FBGEMM 冷热管理机制：用 advise 压制 UVM 自动搬运（2026-06-12 增补）
+
+> **核心命题**："UVM 接管了 H2D/D2H 搬运"这个常见说法**只在 MANAGED 模式成立**。在 MANAGED_CACHING 模式下，FBGEMM 故意用 advise 设置让 UVM 的自动搬运"休眠"，自己夺回搬运决策权——这才是它能在 HBM 上精确维护热数据的根本机制。
+
+##### 两种模式下搬运决策权的归属
+
+| 模式 | 谁决定 H2D/D2H 搬运 | FBGEMM 能否管冷热 |
+|---|---|---|
+| **MANAGED** | ✅ UVM driver 接管（page fault + 自动迁移） | ❌ 管不了（黑盒） |
+| **MANAGED_CACHING** | ❌ UVM 被压制（退居为纯存储后端） | ✅ **FBGEMM 显式管** |
+
+##### MANAGED 模式：UVM 真接管，FBGEMM 管不了冷热
+
+```
+GPU 访问 weights_uvm[idx]
+      ↓
+  UVM driver 检查页表
+      ↓
+  页在 CPU？→ page fault → driver 把 4KB/2MB 页迁到 HBM → 完成访问
+      ↓
+  driver 内部的硬件 LRU 决定哪些页留 HBM、哪些挤回 CPU
+```
+
+- **搬运决策**：driver/HMM 硬件 LRU 启发式
+- **搬运粒度**：4KB / 2MB 页
+- **冷热判断**：页访问频率（硬件统计）
+- **FBGEMM 角色**：只分配 + 设 advise，之后**完全不参与**
+
+这就是 MANAGED 模式性能波动大的原因——driver 启发式对 embedding 长尾访问不一定优化得好，热数据可能被误驱逐，FBGEMM 没法干预。
+
+##### MANAGED_CACHING 模式：三个手段压制 UVM，自己接管冷热
+
+**手段 1：advise 组合让 UVM 不主动迁移**
+
+[memory_utils.cu:202-227](fbgemm_gpu/src/memory_utils/memory_utils.cu#L202)：
+
+```cpp
+gpuMemAdvise(ptr, size, SetPreferredLocation, CPU);      // 数据"家"声明在 CPU
+gpuMemAdvise(ptr, size, SetAccessedBy, current_device);  // GPU 建立到 CPU 的 direct mapping
+```
+
+两步组合的效果（NVIDIA UVM 语义）：
+
+| 场景 | 没有 advise | 有这个 advise 组合 |
+|---|---|---|
+| GPU 访问 UVM 页 | page fault → 页迁到 HBM | **不 fault**，走 direct mapping 直接读 CPU |
+| 页最终位置 | driver 决定（可能 HBM） | **永远在 CPU**（preferred location） |
+
+即：FBGEMM 让 UVM driver **承诺"我不主动搬你的页"**。UVM 的 page migration 机制在 MANAGED_CACHING 模式下基本是**休眠**的。
+
+**手段 2：FBGEMM 自己分配独立的 HBM cache 池**
+
+[training.py:3602-3630](fbgemm_gpu/fbgemm_gpu/split_table_batched_embeddings_ops_training.py#L3602)：
+
+```python
+self.lxu_cache_weights = torch.zeros(C*A, D, device=current_device)  # ★ 普通 HBM 分配, 非 UVM
+self.lxu_cache_state   = torch.zeros(C, A, device=current_device)    # 每路存的行号
+self.lru_state         = torch.zeros(C, A, device=current_device)    # LRU 时间戳
+```
+
+**注意**：`lxu_cache_weights` 是 `register_buffer(device=cuda)` 分配的**普通 HBM tensor**，跟 UVM 没有任何关系。这是一个完全独立于 UVM 的、FBGEMM 自己控制的 HBM 区域。
+
+**手段 3：显式 kernel 做冷热搬运（不走 UVM）**
+
+[lru_cache_populate.cu:17-165](fbgemm_gpu/src/split_embeddings_cache/lru_cache_populate.cu#L17)：
+
+```cpp
+// ① Evict: 把冷行从 HBM cache 显式写回 UVM 主存
+warp_cache_evict(lxu_cache_weights[victim], weights_uvm[idx]);  // HBM → UVM (显式拷贝)
+
+// ② Load: 把热行从 UVM 主存显式读到 HBM cache
+warp_cache_load(lxu_cache_weights[slot], weights_uvm[idx]);     // UVM → HBM (显式拷贝)
+```
+
+- `weights_uvm[idx]` 读取**不触发 page fault**（因为手段 1 的 `SetAccessedBy`），直接走 PCIe 读 CPU 内存
+- `warp_cache_load` / `warp_cache_evict` 是**显式 memcpy**，FBGEMM kernel 自己发的搬运指令，**跟 UVM driver 无关**
+
+##### 冷热判断的具体机制（LRU 时间戳，纯软件）
+
+冷热判断**完全靠软件**，跟 UVM 无关：
+
+**Step 1：访问时打时间戳（行变"热"）**——[lru_cache_find.cu:78-150](fbgemm_gpu/src/split_embeddings_cache/lru_cache_find.cu#L78)：
+
+```cpp
+// 对命中的行: 更新时间戳 = 当前 batch id (变热)
+lru_state[cache_set][slot] = time_stamp;
+```
+
+`time_stamp` 单调递增。**最近被访问的行，时间戳最新（最热）**。
+
+**Step 2：驱逐时找最旧的（行变"冷"被踢）**——[lru_cache_populate.cu:17-165](fbgemm_gpu/src/split_embeddings_cache/lru_cache_populate.cu#L17)：
+
+```cpp
+// 一个 warp 处理一个 cache set, BitonicSort 在 32 路里找时间戳最旧的
+int oldest_slot = warp_find_oldest(lru_state[set]);  // 时间戳最小 = 最久没访问 = 最冷
+// 把 oldest_slot 作为 victim 驱逐, 腾位置给新行
+```
+
+**冷热逻辑总结**：
+- 热行 = 时间戳新 = 最近被访问 → 留在 HBM cache
+- 冷行 = 时间戳旧 = 长时间没访问 → 被 evict 回 UVM（CPU DRAM）
+- **整个判断纯软件、纯应用层，UVM driver 完全不参与**
+
+##### 完整数据流（三层架构）
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│  存储层（UVM 只在这层，纯池子）                                   │
+│  weights_uvm [total_rows, D]  ← cudaMallocManaged, 家在 CPU      │
+│  ★ UVM driver 不主动搬它（被 advise 压制）                        │
+└─────────────────────────────────────────────────────────────────┘
+                          ↑↓ 显式 memcpy
+┌─────────────────────────────────────────────────────────────────┐
+│  搬运层（FBGEMM kernel，完全自己控制）                            │
+│  warp_cache_load (UVM→HBM)  /  warp_cache_evict (HBM→UVM)        │
+│  ★ 决策依据：lru_state 时间戳                                    │
+└─────────────────────────────────────────────────────────────────┘
+                          ↑↓
+┌─────────────────────────────────────────────────────────────────┐
+│  cache 层（普通 HBM，非 UVM）                                     │
+│  lxu_cache_weights [C×A, D]  ← register_buffer(device=cuda)      │
+│  lxu_cache_state   [C, A]    ← 每路存的行号                       │
+│  lru_state         [C, A]    ← 每路最近访问时间戳                  │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+##### 两种模式"热数据进 HBM"机制对比
+
+| 维度 | MANAGED（UVM 接管） | MANAGED_CACHING（FBGEMM 接管） |
+|---|---|---|
+| 谁决策热数据进 HBM | **UVM driver** 硬件启发式 | **FBGEMM LRU kernel** |
+| 搬运触发 | page fault | `lru_cache_insert_kernel` 显式调用 |
+| 搬运粒度 | 4KB / 2MB 页 | embedding 行（D×2B，几十~几百字节） |
+| 冷热判断依据 | 页访问频率（硬件统计） | 软件时间戳 |
+| 可控性 | ❌ 完全不可控 | ✅ `cache_load_factor` + LRU/LFU/Direct-mapped |
+| 替换策略 | 硬件 LRU（不可调） | 软件 LRU / LFU / Direct-mapped（可选） |
+| 防 thrashing | ❌ 无 | ✅ `lock_cache_line`（forward 中的行不驱逐） |
+| HBM 占用 | driver 决定，不可调 | `cache_load_factor` 精确控制 |
+
+##### 为什么 FBGEMM 要"绕开" UVM 的自动搬运
+
+Meta 工程师的设计权衡，原因很实在：
+
+1. **粒度问题**：UVM 按 4KB 页搬，一个 128 维 fp16 的 embedding 行只有 256B，一个页装 16 行——**页级搬运对 embedding 太粗**，会把无关的冷行一起搬进 HBM 浪费带宽
+2. **替换策略不可控**：UVM 的硬件 LRU 是通用启发式，**不懂 embedding 的访问模式**（比如某行虽然在 cache 里但实际是冷的，UVM 不知道）
+3. **长尾延迟不可预测**：page fault 抖动会让 batch 延迟方差大，训练 throughput 不稳；FBGEMM 自己的 cache 命中走 HBM，miss 走显式 memcpy，延迟**可预测、可调优**
+4. **优化器一致性**：训练时要同时更新 UVM 主存和 HBM cache 副本（[embedding_inplace_update.cu:84-98](fbgemm_gpu/src/embedding_inplace_ops/embedding_inplace_update.cu#L84)），如果让 UVM 也参与搬运，两套机制会打架
+
+> **一句话**：UVM 的自动搬运是为"通用 GPU 计算"设计的，对"稀疏 embedding lookup"这种特定 workload 不够好。所以 FBGEMM 借用 UVM 的"统一地址 + 按需访问 CPU"能力，但**剥离了它的"自动搬运决策"**，换成自己更懂业务的 cache 逻辑。
+
 ### 3.3 算子-文件对照表
 
 | 算子 / 接口 | 文件 | UVM 形参 / 缓冲 |
