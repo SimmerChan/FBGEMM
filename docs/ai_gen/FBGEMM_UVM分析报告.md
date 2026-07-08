@@ -937,6 +937,125 @@ Tensor uvm_to_cpu(const Tensor& t) {
 
 > "我直接用 cudaMalloc+memcpy" 这其实是个**降级方案**——放弃了 UVM 提供的全部"统一地址空间"红利，只为"避免用 UVM"这个目标。**ROI 是负的**。
 
+### 3.2.7 物理分配模型：HBM 80GB 时 `cudaMallocManaged(100GB)` 的实际存储拆分
+
+> **可信度图例**：🟢 来自 FBGEMM 源码直接证据 / 🟡 来自 CUDA 公开行为 / 🔴 来自 driver 内部推断（可能因驱动版本而异）
+
+#### 申请瞬间的物理状态
+
+| 项 | 状态 | 说明 | 可信度 |
+|---|---|---|---|
+| **虚拟地址空间** | 100 GB | 已预留，指针正常返回 | 🟢 |
+| **HBM 物理占用** | **0 GB** | 未分配物理页 | 🟡 |
+| **Host 物理占用** | **0 GB** | 未分配物理页 | 🟡 |
+| **swap 占用** | 0 GB | 取决于 driver 实现 | 🔴 |
+
+**关键事实**：`cudaMallocManaged` **只预留虚拟地址，不分配物理内存**。这一刻 HBM 和 Host 都是 0。
+
+对照 `cudaMalloc(100GB)`：在 80GB HBM 上**直接 OOM 返回失败**；`cudaMallocManaged(100GB)` **成功**。
+
+> **源码证据**：[memory_utils.cu:97](fbgemm_gpu/src/memory_utils/memory_utils.cu#L97) 的 `cudaMallocManaged(&ptr, size_bytes)` 只接收 `size_bytes` 并返回指针，无任何物理页预分配逻辑。
+
+#### 第一次访问：page fault 触发 lazy 物理页分配
+
+CUDA driver 按 **页粒度**（典型 4KB，HugePage 模式 2MB）分配物理页，行为取决于 `cudaMemAdvise` 设置：
+
+##### 场景 A：FBGEMM 的默认 `new_managed_tensor` 流程
+
+[memory_utils.cu:202-227](fbgemm_gpu/src/memory_utils/memory_utils.cu#L202-L227) 的 5 步流程中，**第 2、3 步**直接决定了物理页的去向：
+
+```cpp
+// line 203-214
+cudaMemAdviseSetPreferredLocation → CPU（host）       // 🟢 源码
+// line 218-227
+cudaMemAdviseSetAccessedBy → current_device（GPU）   // 🟢 源码
+```
+
+两个 advise 的语义：
+
+| advise | 含义 | 对物理页的影响 |
+|---|---|---|
+| `PreferredLocation=CPU` | driver 倾向把页放在 host | 页默认在 host，GPU 访问时按需 fault 迁出 |
+| `AccessedBy=GPU` | GPU 可以**直接读** host 内存不触发 page fault | GPU 读路径走 zero-copy，**写操作仍会 fault 并迁到 HBM** |
+
+[memory_utils.cu:216-217](fbgemm_gpu/src/memory_utils/memory_utils.cu#L216-L217) 的源码注释明确证实了这一点：
+> "User hints with 'accessed by': GPU will establish direct mapping of data in CPU memory, no page faults will be generated"
+
+##### 场景 B：用户自己写裸 `cudaMallocManaged` + 不设 advise
+
+driver 使用**默认策略**（"fault-on-access, migrate to first accessor"）：
+
+| 触发者 | 行为 | 物理页去向 |
+|---|---|---|
+| **CPU 首次访问** | page fault，页从 zero-page 复制到 host | Host |
+| **GPU 首次访问** | page fault，页从 zero-page 复制到 HBM | HBM |
+| **谁访问，页就在哪** | 不主动迁移 | 取决于**最近一次**访问者 |
+
+#### 100GB 申请 + 80GB HBM 的具体拆分
+
+##### 情况 1：只读不写 + FBGEMM `new_managed_tensor`
+
+```
+HBM 占用: 0 GB（GPU 走 zero-copy 读 host，无 fault）
+Host 占用: 100 GB（全部页都在 host）
+```
+
+##### 情况 2：随机读写 + FBGEMM `new_managed_tensor`（最常见）
+
+- 假设工作集 W=100GB（全部页都访问过）
+- driver 在 HBM 和 Host 之间 LRU 调度
+- **HBM 占用 ≈ 80 GB**（HBM 满）
+- **Host 占用 ≈ 100 GB**（所有页在 host 有一份 copy，HBM 的页在 host 也有 stale copy，driver 实现相关）
+- **总物理内存 ≥ 100 GB**
+
+##### 情况 3：整张表 GPU 高频训练 + FBGEMM `new_managed_tensor`
+
+- 100GB 频繁被 GPU 读写
+- driver 倾向把所有页放 HBM，但 HBM 装不下
+- LRU 强制换出 20GB 到 host
+- **HBM 占用 = 80 GB**（满）
+- **Host 占用 ≥ 20 GB**（被换出的冷页）
+- **被换出的页每次再被访问 → page fault → 重新换入 → 抖动（thrashing）**
+
+这就是 **MANAGED 模式在大表场景性能差** 的根本原因。
+
+##### 情况 4：FBGEMM `MANAGED_CACHING` 模式 + `cache_load_factor=0.2`
+
+```
+table_size = 100 GB
+HBM cache  = 100 × 0.2 = 20 GB   ← FBGEMM 显式管理
+UVM (host) = 80 GB               ← FBGEMM 整张表放这
+```
+
+FBGEMM 在 [lru_cache_populate.cu:17-165](fbgemm_gpu/src/split_embeddings_cache/lru_cache_populate.cu#L17-L165) 用 `warp_cache_load` / `warp_cache_evict` 显式控制哪些 UVM 页进 HBM cache：
+
+- HBM cache 区域（20GB）：`PreferredLocation=DEVICE`, `AccessedBy=GPU` → driver 优先放 HBM
+- UVM 区域（80GB）：`PreferredLocation=CPU`, `AccessedBy=GPU` → driver 优先放 host
+- FBGEMM 自己用 `cudaMemcpy` 把热行拷进 cache，cold 行拷回 UVM
+
+最终物理占用：
+
+```
+HBM 占用 ≈ 20 GB（HBM cache，锁死不会超）
+Host 占用 ≈ 100 GB（UVM 整张表 + cache 在 host 的备份，driver 实现相关）
+```
+
+**不会发生 thrashing**，因为 HBM 上限被 FBGEMM 显式锁死（详见 §3.2.5 冷热管理机制）。
+
+#### 关键认知差异（评审会必讲）
+
+| 错误认知 | 正确理解 | 可信度 |
+|---|---|---|
+| "100GB 申请，driver 会从 HBM/Host 各分一些" | ❌ driver **不主动**平均分，**按访问模式 + advise 动态调度** | 🟡 |
+| "HBM 装不下会 OOM" | ❌ `cudaMallocManaged` 不会 OOM（只受虚拟地址空间限制），只有 `cudaMalloc` 才会 | 🟡 |
+| "UVM 是 driver 自动搬运" | ⚠️ 部分对，但**频繁抖动**时性能崩塌 | 🟡 |
+| "100GB 申请后立刻占 100GB 物理" | ❌ 只占**实际访问过**的页 | 🟡 |
+| "FBGEMM 的 HBM cache 上限 20GB 是 driver 决定的" | ❌ 是 FBGEMM 用 `cache_load_factor=0.2` 显式锁死的 | 🟢 |
+
+#### 评审会"一句话杀手锏"
+
+> **"`cudaMallocManaged(100GB)` 申请瞬间 HBM 占用 0GB、Host 占用 0GB**，物理页是**按访问 lazy 分配**的；当某页被 GPU 首次写访问时，driver 触发 page fault，按 `PreferredLocation` 设置把页放 HBM 还是 Host；如果没设 advise 或设了 `DEVICE`，driver 会把页全堆到 HBM，**80GB HBM 装满 100GB 时会发生 LRU 抖动**；FBGEMM 的 `MANAGED_CACHING` 模式用 `cache_load_factor=0.2` 显式锁住 HBM 容量 20GB，UVM 区 80GB 用 `PreferredLocation=CPU` 引导 driver 放 host，**根本不依赖 UVM 自动搬运**——这才是昇腾 UVM 硬件必须实现的语义：**不是自动迁移，是 advised placement + accessed-by 直连 + lazy fault**。"**
+
 ### 3.3 算子-文件对照表
 
 | 算子 / 接口 | 文件 | UVM 形参 / 缓冲 |
