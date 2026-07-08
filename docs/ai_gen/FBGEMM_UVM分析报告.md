@@ -807,6 +807,136 @@ Meta 工程师的设计权衡，原因很实在：
 
 > **一句话**：UVM 的自动搬运是为"通用 GPU 计算"设计的，对"稀疏 embedding lookup"这种特定 workload 不够好。所以 FBGEMM 借用 UVM 的"统一地址 + 按需访问 CPU"能力，但**剥离了它的"自动搬运决策"**，换成自己更懂业务的 cache 逻辑。
 
+#### 3.2.6 为什么不能纯 cudaMalloc + cudaMemcpy 替代 UVM（2026-06-12 增补）
+
+> **核心命题**：MANAGED_CACHING 模式下，FBGEMM 确实用 kernel 接管了"搬运"这一步，但这只是冰山一角。FBGEMM 真正依赖 UVM 的，是一组**纯 cudaMalloc 根本做不到**的"统一地址空间"能力。
+
+##### 纯 cudaMalloc vs UVM 的本质区别
+
+| 能力 | 纯 `cudaMalloc` | `cudaMallocManaged` (UVM) |
+|---|---|---|
+| **同一份指针，CPU 和 GPU 都能 deref** | ❌ 不能 | ✅ **能**（这是核心） |
+| **GPU 端写完后 CPU 端能直接读到** | ❌ 必须显式 `cudaMemcpy(DeviceToHost)` | ✅ 写完直接读，driver 保证一致性 |
+| **跨进程传递（fork）** | ❌ 指针随 context 死 | ✅ 子进程能继承 UVM 区域 |
+| **超量分配（> HBM 容量）** | ❌ 满了就 OOM | ✅ 溢出到 host memory |
+| **PyTorch tensor 互操作** | ⚠️ `.cpu()` 触发完整 D2H 拷贝 | ✅ `uvm_to_cpu()` **不复制数据** |
+
+**一句话**：UVM 的核心价值不是"搬运"，是"**CPU 和 GPU 共享同一份虚拟地址空间**"。搬运只是这个能力的一个副作用。
+
+##### FBGEMM 实际用到的"纯 cudaMalloc 做不到"的能力
+
+###### 能力 1：CPU 和 GPU 共享同一份指针
+
+**场景 A：优化器在 CPU 端做 rowwise adagrad norm 计算**
+
+[embedding_optimizer_split_device_kernel_template.cuh:99](fbgemm_gpu/codegen/training/optimizer/embedding_optimizer_split_device_kernel_template.cuh#L99)：
+
+```cpp
+{{ tensor }} = &{{ tensor }}_uvm[{{ tensor }}_offset];
+// 优化器直接拿到 UVM 指针, 在 GPU kernel 里读写同一份
+```
+
+如果用纯 `cudaMalloc`：
+- 优化器状态（momentum1/momentum2/prev_iter）必须独立存两份
+- 一份在 GPU HBM（GPU 端算梯度用）
+- 一份在 CPU DRAM（CPU 端算 norm）
+- 两份之间必须用 cudaMemcpy 同步
+- **UVM 模式下：只有一份，CPU/GPU 都用 `*_uvm[offset]` 拿指针**
+
+**场景 B：CPU 端直接读 UVM tensor 的标量**
+
+[raw_embedding_streamer.cpp:21-28](fbgemm_gpu/src/split_embeddings_cache/raw_embedding_streamer.cpp#L21)：
+
+```cpp
+// 注释原文：
+// "Read a scalar value from a tensor that is maybe a UVM tensor.
+//  Note that `tensor.item<type>()` is not allowed on a UVM tensor in PyTorch"
+inline int64_t get_maybe_uvm_scalar(const at::Tensor& tensor) {
+    return *tensor.data_ptr<int>();  // ★ 绕开 .item() 限制, 直接 deref UVM 指针
+}
+```
+
+**为什么 PyTorch 的 `.item()` 不支持 UVM**？因为 `.item()` 内部要做 device→host 同步，对普通 `cudaMalloc` tensor 是 D2H 拷贝，但 PyTorch 不想"为 UVM 触发隐式拷贝"。FBGEMM 用 `*data_ptr<int>()` 绕过——**直接 deref UVM 指针**。
+
+如果用纯 cudaMalloc，**这种 CPU 端直接读 GPU tensor 标量的能力就丢了**，每次都必须先 cudaMemcpy。
+
+###### 能力 2：PyTorch tensor 重新解释 storage（不复制数据）
+
+[memory_utils.cu:321-373](fbgemm_gpu/src/memory_utils/memory_utils.cu#L321) `uvm_to_cpu` / `uvm_to_device`：
+
+```cpp
+Tensor uvm_to_cpu(const Tensor& t) {
+    // 重新解释 storage 为 CPU 视角, 不复制数据
+    auto storage = Storage(
+        ...,
+        ocontext->ptr_,  // ★ 用同一个 UVM 指针
+        ...
+        {at::DeviceType::CPU}  // 但 device type 改为 CPU
+    );
+    ...
+}
+```
+
+**核心**：UVM tensor 可以**零拷贝**地"切换" device 视角（CPU/GPU 任一），因为底层是同一份物理内存 + 同一份页表。
+
+如果用纯 `cudaMalloc`：每次 `tensor.cpu()` 都会触发完整 D2H 拷贝，**几百 GB 表直接卡死**。
+
+###### 能力 3：超量分配（> HBM 容量）
+
+| 场景 | 表容量 | 单卡 HBM | 用 cudaMalloc | 用 cudaMallocManaged |
+|---|---|---|---|---|
+| 推荐系统 | 200 GB | 80 GB | ❌ **OOM** | ✅ 溢出到 CPU |
+| 短视频 embedding | 500 GB | 80 GB | ❌ **OOM** | ✅ 溢出到 CPU |
+
+**这是 UVM 存在的根本原因**——纯 `cudaMalloc` 装不下的表，必须用 UVM（或显式手动管理两块内存）。
+
+> "FBGEMM 自己用 kernel 做行级 memcpy"——这话没错，但**前提是有内存可搬**。如果连初始分配都 OOM 了，搬运再精妙也白搭。UVM 的 `cudaMallocManaged` 是**唯一能保证超量分配**的官方接口。
+
+###### 能力 4：跨进程传递
+
+`new_managed_tensor` 自动调 `madvise(MADV_DONTFORK)`（[memory_utils.cu:234](fbgemm_gpu/src/memory_utils/memory_utils.cu#L234)）—— **为什么这个 workaround 存在**？
+
+因为 fork() 之后：
+- UVM 内存：子进程能继承（fork 前 madvise DONTFORK 避免重映射开销）
+- 纯 cudaMalloc 内存：子进程的 cuda context 是新的，**指针直接失效**
+
+搜广推典型场景：
+- PS worker fork 出 serving worker
+- 训练进程 fork 出 inference 进程做 checkpoint loading
+- 这类 fork-after-allocate 模式，**纯 cudaMalloc 完全不能工作**
+
+##### 纯 cudaMalloc 替代 UVM 的"全账"
+
+**需要重新实现的东西**：
+
+| FBGEMM 现状（用 UVM） | 用纯 cudaMalloc 必须做的事 |
+|---|---|
+| 优化器 GPU/CPU 共享一份状态 | 维护两套状态，cudaMemcpy 同步，**代码量翻倍** |
+| `get_maybe_uvm_scalar()` CPU 端直接读 | 每次读标量都 cudaMemcpy，**embedding streamer 性能崩** |
+| `uvm_to_cpu(t)` 零拷贝切换视角 | `tensor.cpu()` 触发完整 D2H 拷贝，**几百 GB 表直接卡死** |
+| 超量分配放 host 内存 | 自己实现 host/device 内存分配器，**重新造一个 PyTorch caching allocator** |
+| 跨进程传递 | 完全做不到（除非走共享内存 + IPC，**复杂度爆炸**） |
+
+**总账**：纯 cudaMalloc 方案至少要重写 1000+ 行代码，且性能大概率不如 UVM 路径（因为缺少"统一地址空间"这个核心抽象）。
+
+##### 核心反驳（一句话）
+
+> **UVM 给 FBGEMM 提供的不是"自动搬运"，是"统一虚拟地址空间"这个底层抽象。FBGEMM 借这个抽象实现了 4 件事：(1) 优化器 CPU/GPU 共享一份状态、(2) 跨进程传递、(3) 超量分配、(4) tensor 零拷贝切换视角。这 4 件事纯 cudaMalloc + cudaMemcpy 做不到，要么代码量爆炸，要么性能崩。FBGEMM 的 `warp_cache_load` / `warp_cache_evict` 是在 UVM 抽象之上做的"行级搬运优化"，不依赖 UVM 的自动搬运——但仍然依赖 UVM 的"统一地址 + 按需访问 CPU"能力。**
+
+##### 重新审视问题的视角
+
+把这个问题反过来看：
+
+| 问题 | 答案 |
+|---|---|
+| 不用 UVM，纯 cudaMalloc 能写一个 embedding cache 吗？ | ⚠️ 理论上能，但只解决了"搬运"问题 |
+| 不用 UVM，能做超量分配吗？ | ❌ 做不到（HBM 满就 OOM） |
+| 不用 UVM，能让 CPU/GPU 共享一份优化器 state 吗？ | ❌ 做不到（必须双份 + 同步） |
+| 不用 UVM，能做跨进程 embedding 表传递吗？ | ❌ 做不到（cudaMalloc 指针 context-bound） |
+| 不用 UVM，能零拷贝切换 tensor 视角吗？ | ❌ 做不到（会触发完整 D2H 拷贝） |
+
+> "我直接用 cudaMalloc+memcpy" 这其实是个**降级方案**——放弃了 UVM 提供的全部"统一地址空间"红利，只为"避免用 UVM"这个目标。**ROI 是负的**。
+
 ### 3.3 算子-文件对照表
 
 | 算子 / 接口 | 文件 | UVM 形参 / 缓冲 |
