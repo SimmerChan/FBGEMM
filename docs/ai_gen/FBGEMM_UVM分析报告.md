@@ -1029,18 +1029,20 @@ UVM (host) = 80 GB               ← FBGEMM 整张表放这
 
 FBGEMM 在 [lru_cache_populate.cu:17-165](fbgemm_gpu/src/split_embeddings_cache/lru_cache_populate.cu#L17-L165) 用 `warp_cache_load` / `warp_cache_evict` 显式控制哪些 UVM 页进 HBM cache：
 
-- HBM cache 区域（20GB）：`PreferredLocation=DEVICE`, `AccessedBy=GPU` → driver 优先放 HBM
-- UVM 区域（80GB）：`PreferredLocation=CPU`, `AccessedBy=GPU` → driver 优先放 host
-- FBGEMM 自己用 `cudaMemcpy` 把热行拷进 cache，cold 行拷回 UVM
+- **HBM cache 区域（20GB）**：是**普通 CUDA tensor**（[lxu_cache.cu:415, 472](fbgemm_gpu/src/split_embeddings_cache/lxu_cache.cu#L415) 用 `at::empty` 分配），**不是 UVM**，**不调任何 advise**——driver 看到普通 CUDA tensor 自然放 HBM
+- **UVM 区域（80GB）**：`PreferredLocation=CPU`, `AccessedBy=GPU`（[memory_utils.cu:202-227](fbgemm_gpu/src/memory_utils/memory_utils.cu#L202)）→ driver 优先放 host
+- FBGEMM 自己用 `cudaMemcpy` 把热行从 UVM 拷进 HBM cache，cold 行拷回 UVM
 
 最终物理占用：
 
 ```
-HBM 占用 ≈ 20 GB（HBM cache，锁死不会超）
+HBM 占用 ≈ 20 GB（HBM cache，普通 CUDA tensor，锁死不会超）
 Host 占用 ≈ 100 GB（UVM 整张表 + cache 在 host 的备份，driver 实现相关）
 ```
 
-**不会发生 thrashing**，因为 HBM 上限被 FBGEMM 显式锁死（详见 §3.2.5 冷热管理机制）。
+**不会发生 thrashing**，因为：
+- HBM 上限被 FBGEMM 显式锁死（`cache_load_factor=0.2`）
+- HBM cache 本身不是 UVM，**不参与 UVM 的 LRU 调度**（详见 §3.2.5 冷热管理机制和 §3.2.8 advise 选项详解）
 
 #### 关键认知差异（评审会必讲）
 
@@ -1051,10 +1053,152 @@ Host 占用 ≈ 100 GB（UVM 整张表 + cache 在 host 的备份，driver 实�
 | "UVM 是 driver 自动搬运" | ⚠️ 部分对，但**频繁抖动**时性能崩塌 | 🟡 |
 | "100GB 申请后立刻占 100GB 物理" | ❌ 只占**实际访问过**的页 | 🟡 |
 | "FBGEMM 的 HBM cache 上限 20GB 是 driver 决定的" | ❌ 是 FBGEMM 用 `cache_load_factor=0.2` 显式锁死的 | 🟢 |
+| "HBM cache 区域设了 `PreferredLocation=DEVICE`" | ❌ HBM cache 是**普通 CUDA tensor**（[lxu_cache.cu:415, 472](fbgemm_gpu/src/split_embeddings_cache/lxu_cache.cu#L415)），**不调任何 advise**，不放 HBM 才怪 | 🟢 |
 
 #### 评审会"一句话杀手锏"
 
 > **"`cudaMallocManaged(100GB)` 申请瞬间 HBM 占用 0GB、Host 占用 0GB**，物理页是**按访问 lazy 分配**的；当某页被 GPU 首次写访问时，driver 触发 page fault，按 `PreferredLocation` 设置把页放 HBM 还是 Host；如果没设 advise 或设了 `DEVICE`，driver 会把页全堆到 HBM，**80GB HBM 装满 100GB 时会发生 LRU 抖动**；FBGEMM 的 `MANAGED_CACHING` 模式用 `cache_load_factor=0.2` 显式锁住 HBM 容量 20GB，UVM 区 80GB 用 `PreferredLocation=CPU` 引导 driver 放 host，**根本不依赖 UVM 自动搬运**——这才是昇腾 UVM 硬件必须实现的语义：**不是自动迁移，是 advised placement + accessed-by 直连 + lazy fault**。"**
+
+### 3.2.8 FBGEMM 实际使用的 advise 选项与内存分配行为
+
+> **可信度图例**：🟢 来自 FBGEMM 源码直接证据 / 🟡 来自 CUDA 公开行为 / 🔴 来自 driver 内部推断（可能因驱动版本而异）
+
+#### 4 处 advise 调用点（穷举）
+
+| # | 调用函数 | advise 选项 | 源码位置 | 调用次数 |
+|---|---|---|---|---|
+| 1 | `new_managed_tensor`（硬编码） | `SetPreferredLocation=CPU` | [memory_utils.cu:202-214](fbgemm_gpu/src/memory_utils/memory_utils.cu#L202) | 每次 UVM tensor 创建 |
+| 2 | `new_managed_tensor`（硬编码） | `SetAccessedBy=GPU` | [memory_utils.cu:218-227](fbgemm_gpu/src/memory_utils/memory_utils.cu#L218) | 每次 UVM tensor 创建 |
+| 3 | `uvm_cuda_mem_advise`（Python 入口） | 6 种之一 | [memory_utils.cu:415-424](fbgemm_gpu/src/memory_utils/memory_utils.cu#L415) | 由用户调用 |
+| 4 | `uvm_mem_advice_dont_fork` | `madvise(MADV_DONTFORK)`（**OS 内核调用，不是 CUDA advise**） | [memory_utils.cu:480-481](fbgemm_gpu/src/memory_utils/memory_utils.cu#L480) | fork 兼容性场景 |
+
+**重要发现**：HBM cache 区域（`lxu_cache_weights`）是**普通 CUDA tensor**（[lxu_cache.cu:415, 472](fbgemm_gpu/src/split_embeddings_cache/lxu_cache.cu#L415) 用 `at::empty` 分配），**不是 UVM，**不调任何 cudaMemAdvise**——driver 看到普通 CUDA tensor 自然放 HBM。这也修正了 §3.2.7 情况 4 中"HBM cache 区域 PreferredLocation=DEVICE"的错误表述。
+
+#### FBGEMM 暴露给 Python 的 6 种 advise 枚举
+
+[memory_utils.cu:550-575](fbgemm_gpu/src/memory_utils/memory_utils.cu#L550) 注册到 Python `fbgemm_gpu_uvm_enum_query`：
+
+| Python 枚举名 | CUDA 枚举值 | FBGEMM 内部使用 |
+|---|---|---|
+| `AdviseSetReadMostly` | `cudaMemAdviseSetReadMostly` | ❌ **从未在 C++ 调用** |
+| `AdviseUnsetReadMostly` | `cudaMemAdviseUnsetReadMostly` | ❌ 同上 |
+| `AdviseSetPreferredLocation` | `cudaMemAdviseSetPreferredLocation` | ✅ `new_managed_tensor` 硬编码 |
+| `AdviseUnsetPreferredLocation` | `cudaMemAdviseUnsetPreferredLocation` | ❌ 仅暴露给 Python |
+| `AdviseSetAccessedBy` | `cudaMemAdviseSetAccessedBy` | ✅ `new_managed_tensor` 硬编码 |
+| `AdviseUnsetAccessedBy` | `cudaMemAdviseUnsetAccessedBy` | ❌ 仅暴露给 Python |
+
+#### 每个 advise 的内存分配行为详解
+
+##### ① `SetPreferredLocation=CPU`（FBGEMM 唯一硬编码的 placement advise）
+
+**driver 行为**：把该 UVM 区域的页**首选位置**标记为 host（CPU）内存，是 **hint（提示）** 而非强制。
+
+| 触发事件 | 物理页去向 |
+|---|---|
+| 分配后无访问 | 物理页 0 占用，**不预分配** |
+| CPU 首次访问 | page fault → 页从 zero-page 复制到 **Host** |
+| GPU 首次写访问 | page fault → 页从 zero-page 复制到 **HBM**（但 driver 倾向 LRU 回 host） |
+| GPU 频繁访问 | 页**暂时**留在 HBM，driver 周期性 LRU 回 host |
+| GPU 长期不访问 | 页**主动**迁回 host（hint 作用） |
+
+**本质**：让 driver 知道"这些页是 host-resident 的，HBM 满了优先换出"。
+
+##### ② `SetAccessedBy=GPU`（FBGEMM 唯一硬编码的 access advise）
+
+**driver 行为**：告诉 driver GPU 也会读这个区域，**预先建立 GPU 到 host 内存的直接映射**。
+
+源码注释（[memory_utils.cu:216-217](fbgemm_gpu/src/memory_utils/memory_utils.cu#L216)）：
+> "User hints with 'accessed by': GPU will establish direct mapping of data in CPU memory, no page faults will be generated"
+
+| 触发事件 | 物理页去向 |
+|---|---|
+| GPU **读** host 内存 | **零拷贝**，不触发 page fault，**不迁移**页 |
+| GPU **写** host 内存 | **page fault**，**强制迁移**到 HBM |
+| CPU 任意访问 | 正常 host 访问，无 fault |
+
+**关键细节**：**只对读操作省 fault**；写操作仍会强制迁移。这就是为什么 FBGEMM 的 `MANAGED_CACHING` 模式能高效：HBM cache 是**普通 CUDA tensor**（无需 advise），UVM 大表设了 `SetAccessedBy=GPU` 让 GPU 读时零拷贝，**写时通过 `warp_cache_load` 显式控制**。
+
+##### ③ `SetReadMostly`（FBGEMM 暴露但内部不用）
+
+**driver 行为**：标记这个 UVM 区域**主要是只读**的，driver **几乎从不**把页从 host 迁到 device。
+
+| 触发事件 | 物理页去向 |
+|---|---|
+| GPU 读 | 零拷贝（与 `SetAccessedBy` 类似） |
+| GPU 写 | 一次性迁移到 HBM，之后回退到 host 行为 |
+
+**FBGEMM 不用它的原因**：
+- FBGEMM 的 UVM 表**是会被训练的**（weights / optimizer states 都会写）
+- 写了之后还要写回 UVM 的场景，`SetReadMostly` 会引发不必要的迁移
+- FBGEMM 选了更细粒度的 `SetPreferredLocation=CPU` + `SetAccessedBy=GPU` 组合，**让 LRU 策略替代 ReadMostly**
+
+##### ④ `SetPreferredLocation=DEVICE`（Python 入口支持但 FBGEMM 不主动调）
+
+**driver 行为**：标记这个 UVM 区域的页**首选位置**为 device，driver LRU 优先把页放 HBM。
+
+| 触发事件 | 物理页去向 |
+|---|---|
+| HBM 装得下 | 所有页都放 HBM |
+| HBM 装不下 | driver 强制把"非首选位置"的页**换出到 host**（§3.2.7 情况 3 抖动场景） |
+
+**FBGEMM 不用它的原因**：MANAGED 模式如果用 `SetPreferredLocation=DEVICE`，HBM 装不下大表会**直接抖动**。FBGEMM 改用 `SetPreferredLocation=CPU`（反向），让 HBM 缓存只装 HBM cache 那一小块（20%）。
+
+##### ⑤ `madvise(MADV_DONTFORK)`（OS 内核调用，**不是 CUDA advise**）
+
+**内核行为**：标记这个 VMA（虚拟内存区域）**不要被 fork 到子进程**。
+
+源码注释（[memory_utils.cu:467-471](fbgemm_gpu/src/memory_utils/memory_utils.cu#L467)）说明问题背景：
+> "During fork() the uvm driver is called to copy VMA for UVM space. The uvm driver then removes pmap entries for both child and parent. Re-establishing the mappings for the parent is slow."
+
+**内存分配行为**：无（这是个**进程隔离 advise**，不影响物理页位置）
+
+#### FBGEMM 实际选用的 advise 组合（最优解分析）
+
+FBGEMM 在 `new_managed_tensor` 中**只硬编码 2 个 advise**：
+
+```cpp
+SetPreferredLocation=CPU + SetAccessedBy=GPU
+```
+
+**为什么这个组合是对的**：
+
+| advise 1 | advise 2 | 组合效果 |
+|---|---|---|
+| `SetPreferredLocation=CPU` | `SetAccessedBy=GPU` | **写时按需 fault 到 HBM**（热数据），**读时 zero-copy 走 host**（冷数据） |
+
+**这正好是 MANAGED_CACHING 模式需要的语义**：
+- 大表（100GB）放在 host，GPU 训练时**只把热行拷进 HBM cache**（FBGEMM 自己控）
+- 冷行留在 host，GPU 偶尔读时**走 zero-copy 不消耗 HBM 容量**
+- 完美避免 §3.2.7 情况 3 的抖动问题
+
+#### 评审会关键事实清单
+
+| 事实 | 证据 | 可信度 |
+|---|---|---|
+| FBGEMM 硬编码 `SetPreferredLocation=CPU` | [memory_utils.cu:202-214](fbgemm_gpu/src/memory_utils/memory_utils.cu#L202) | 🟢 |
+| FBGEMM 硬编码 `SetAccessedBy=GPU` | [memory_utils.cu:218-227](fbgemm_gpu/src/memory_utils/memory_utils.cu#L218) | 🟢 |
+| HBM cache 区域**不调任何 advise**（是普通 CUDA tensor） | [lxu_cache.cu:415, 472](fbgemm_gpu/src/split_embeddings_cache/lxu_cache.cu#L415) | 🟢 |
+| FBGEMM 暴露 6 种 advise 给 Python（3 set + 3 unset） | [memory_utils.cu:550-575](fbgemm_gpu/src/memory_utils/memory_utils.cu#L550) | 🟢 |
+| `SetAccessedBy=GPU` 只对读零拷贝，写仍会迁移 | [memory_utils.cu:216-217](fbgemm_gpu/src/memory_utils/memory_utils.cu#L216) 注释 | 🟢 |
+| FBGEMM 用 `madvise(DONTFORK)` 处理 fork 兼容 | [memory_utils.cu:480-481](fbgemm_gpu/src/memory_utils/memory_utils.cu#L480) | 🟢 |
+| `SetAccessedBy` 的具体 driver 行为（"GPU establish direct mapping"） | CUDA 公开文档 | 🟡 |
+| FBGEMM 选 `CPU+AccessedBy` 组合的原因（替代 ReadMostly） | 代码推论 | 🔴 |
+
+#### 评审会"一句话核心"
+
+> "FBGEMM 在 `new_managed_tensor` 中**只硬编码 2 个 advise**：`SetPreferredLocation=CPU`（让 driver 优先把页放 host）+ `SetAccessedBy=GPU`（让 GPU 读时 zero-copy 不 fault）。HBM cache 区域是**普通 CUDA tensor 不需要 advise**。**昇腾 UVM 硬件必须实现的最小 advise 集合就是这 2 个 + 1 个 OS 兼容性 `madvise(DONTFORK)`**——少了任一个，FBGEMM 都不能跑。"
+
+#### 昇腾 CANN 对照表（适配依据）
+
+| CUDA API | FBGEMM 用法 | 昇腾 CANN 等价 API（待确认） |
+|---|---|---|
+| `cudaMallocManaged` | 申请 100GB UVM | `aclrtMallocManaged`（需确认是否存在） |
+| `cudaMemAdviseSetPreferredLocation` | 引导页放 host | `aclrtMemAdviseSetPreferredLocation`（需确认） |
+| `cudaMemAdviseSetAccessedBy` | GPU 读零拷贝 | `aclrtMemAdviseSetAccessedBy`（需确认） |
+| `cudaMemPrefetchAsync` | 主动预取（FBGEMM 不用） | `aclrtMemPrefetchAsync`（需确认） |
+| `madvise(MADV_DONTFORK)` | fork 兼容 | 操作系统层，CANN 需保证 driver 不破坏此行为 |
+
+> ⚠️ CANN 对照表中的 API 名是**基于 CUDA 公开 API 命名约定的推测**，昇腾 NPU 是否实现、命名是否一致，需要昇腾团队确认。这是评审会上需要昇腾侧明确承诺的部分。
 
 ### 3.3 算子-文件对照表
 
