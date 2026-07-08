@@ -1036,9 +1036,14 @@ FBGEMM 在 [lru_cache_populate.cu:17-165](fbgemm_gpu/src/split_embeddings_cache/
 最终物理占用：
 
 ```
-HBM 占用 ≈ 20 GB（HBM cache，普通 CUDA tensor，锁死不会超）
-Host 占用 ≈ 100 GB（UVM 整张表 + cache 在 host 的备份，driver 实现相关）
+HBM 占用 = 20 GB（lxu_cache_weights，独立普通 CUDA tensor，物理一定在 HBM）
+Host 占用 = 100 GB（weights_uvm 整张表，物理一定在 CPU 内存）
 ```
+
+**两个 tensor 物理上完全分离**：
+- HBM cache 不会出现在 host 上（它不是 UVM，driver 无 UVM 调度）
+- weights_uvm 不会出现在 HBM 上（`SetPreferredLocation=CPU` 引导 driver 不放 HBM）
+- 两者是**两份独立内存**，靠 FBGEMM **显式 cudaMemcpy** 同步（详见 §3.2.9 HBM cache 同步架构）
 
 **不会发生 thrashing**，因为：
 - HBM 上限被 FBGEMM 显式锁死（`cache_load_factor=0.2`）
@@ -1199,6 +1204,205 @@ SetPreferredLocation=CPU + SetAccessedBy=GPU
 | `madvise(MADV_DONTFORK)` | fork 兼容 | 操作系统层，CANN 需保证 driver 不破坏此行为 |
 
 > ⚠️ CANN 对照表中的 API 名是**基于 CUDA 公开 API 命名约定的推测**，昇腾 NPU 是否实现、命名是否一致，需要昇腾团队确认。这是评审会上需要昇腾侧明确承诺的部分。
+
+### 3.2.9 HBM cache 同步架构：独立 tensor + 行级显式 memcpy
+
+> **可信度图例**：🟢 来自 FBGEMM 源码直接证据 / 🟡 来自 CUDA 公开行为 / 🔴 来自 driver 内部推断
+
+#### 核心结论（一句话）
+
+> **`weights_uvm`（100% 整张表的 UVM tensor）与 `lxu_cache_weights`（20% 热行副本的普通 CUDA tensor）是两个物理上完全分离的独立内存**。HBM cache **不是 UVM 的页子集**，是**显式维护的行级副本**。**数据一致性由 FBGEMM 自己保证，不依赖 driver**。
+
+#### 关键区分：UVM page 缓存 vs 显式 tensor 副本
+
+| 维度 | UVM 自身的 page 缓存 | FBGEMM 的 HBM cache |
+|---|---|---|
+| **物理形态** | 同一个 UVM tensor 的页 | **两个独立的 tensor**（UVM + 普通 CUDA） |
+| **同步机制** | driver 按 LRU 自动迁移 | FBGEMM **显式 cudaMemcpy** |
+| **数据一致性** | driver 保证单份数据多副本一致 | FBGEMM 自己维护（`warp_cache_load` / `warp_cache_evict`） |
+| **粒度** | 4KB / 2MB 页 | **一行 embedding**（行级） |
+| **错峰策略** | driver LRU 决定 | FBGEMM 用时间戳决定（[lru_cache_populate.cu:74](fbgemm_gpu/src/split_embeddings_cache/lru_cache_populate.cu#L74)） |
+
+#### 完整架构图（100GB 表为例）
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│ MANAGED_CACHING 模式的内存布局（100GB 表为例）               │
+├─────────────────────────────────────────────────────────────┤
+│                                                             │
+│  CPU 内存（100GB）                                           │
+│  ┌──────────────────────────────────────────────┐           │
+│  │ weights_uvm (cudaMallocManaged)               │           │
+│  │ - SetPreferredLocation = CPU                  │           │
+│  │ - SetAccessedBy = GPU                         │           │
+│  │ - 完整 100GB 表（所有行）                       │           │
+│  │ - physical: 100GB 都在 host 内存               │           │
+│  └──────────────────────────────────────────────┘           │
+│                          ▲                                  │
+│                          │ FBGEMM 显式 cudaMemcpy            │
+│                          │ (warp_cache_load/evict)          │
+│                          │                                  │
+│  HBM（20GB）         ────┘                                  │
+│  ┌──────────────────────────────────────────────┐           │
+│  │ lxu_cache_weights (at::empty 普通 CUDA tensor)│           │
+│  │ - 不是 UVM, 不调任何 advise                    │           │
+│  │ - 只装 cache_load_factor × total_rows × D     │           │
+│  │   = 0.2 × 100GB = 20GB                         │           │
+│  │ - 物理: 20GB 都在 HBM                          │           │
+│  │ - 是 weights_uvm 中"热行"的副本                 │           │
+│  └──────────────────────────────────────────────┘           │
+│                                                             │
+└─────────────────────────────────────────────────────────────┘
+```
+
+#### 两个独立 tensor 的代码证据
+
+| tensor | 分配方式 | 物理位置 | advise | 证据 |
+|---|---|---|---|---|
+| **`weights_uvm`**（100GB 整张表） | `cudaMallocManaged` | CPU 内存（驱动放） | `SetPreferredLocation=CPU` + `SetAccessedBy=GPU` | [memory_utils.cu:97](fbgemm_gpu/src/memory_utils/memory_utils.cu#L97) |
+| **`lxu_cache_weights`**（20GB 缓存） | `at::empty`（普通 CUDA） | HBM（自然放） | **不调任何 advise** | [lxu_cache.cu:415, 472](fbgemm_gpu/src/split_embeddings_cache/lxu_cache.cu#L415) |
+
+**关键结论**：
+- HBM cache **不是 UVM tensor 的一个"页子集"**
+- HBM cache **是一个独立的普通 CUDA tensor**，**与 `weights_uvm` 没有 UVM 关系**
+- 两者靠 FBGEMM 的**显式 cudaMemcpy** 维持数据同步
+
+#### 显式同步的两个原语
+
+##### ① `warp_cache_load`：[weight_row.cuh:346-367](fbgemm_gpu/include/fbgemm_gpu/utils/weight_row.cuh#L346)
+
+注释原话：
+> "Load the row from the embedding table into the cache"
+
+代码语义（[weight_row.cuh:354](fbgemm_gpu/include/fbgemm_gpu/utils/weight_row.cuh#L354)）：
+```cpp
+// cache_row_ ← row_  （HBM ← UVM）
+same_type_vector_copy(cache_row_ + d, reinterpret_cast<const cache_t*>(row_ + d));
+```
+
+| 项 | 值 |
+|---|---|
+| **方向** | UVM tensor（CPU 内存）→ HBM cache |
+| **粒度** | 一行 embedding（`dim_` 个元素） |
+| **触发时机** | cache miss，需要把热行从 UVM 拉到 HBM |
+| **调用位置** | [lru_cache_populate.cu:142-146](fbgemm_gpu/src/split_embeddings_cache/lru_cache_populate.cu#L142) 的 `lru_cache_insert_kernel` |
+
+##### ② `warp_cache_evict`：[weight_row.cuh:395-440](fbgemm_gpu/include/fbgemm_gpu/utils/weight_row.cuh#L395)
+
+注释原话：
+> "Evict the row from the cache and into the embedding table"
+
+代码语义（[weight_row.cuh:378-379](fbgemm_gpu/include/fbgemm_gpu/utils/weight_row.cuh#L378)）：
+```cpp
+// row_ ← cache_row_  （UVM ← HBM）
+same_type_vector_copy(
+    reinterpret_cast<emb_t*>(row_ + d),
+    reinterpret_cast<const cache_t*>(cache_row_ + d));
+```
+
+| 项 | 值 |
+|---|---|
+| **方向** | HBM cache → UVM tensor（CPU 内存） |
+| **粒度** | 一行 embedding |
+| **触发时机** | cache 满，需要把冷行从 HBM 写回 UVM |
+| **调用位置** | [lru_cache_populate.cu:127-134](fbgemm_gpu/src/split_embeddings_cache/lru_cache_populate.cu#L127) 的 `lru_cache_insert_kernel`（在 load 之前先 evict） |
+| **副作用** | 如果是 INT8 量化表，会**重新计算 qparams** 并写回 UVM（[weight_row.cuh:400-419](fbgemm_gpu/include/fbgemm_gpu/utils/weight_row.cuh#L400)） |
+
+#### 同步流程（[lru_cache_populate.cu:111-146](fbgemm_gpu/src/split_embeddings_cache/lru_cache_populate.cu#L111)）
+
+```cpp
+// 步骤 1: 槽位已被占用, 先把旧行写回 UVM
+if (current_idx != kCacheStateInvalid) {
+    WeightRow<emb_t, cache_t, cache_t>(
+        &weights[weights_offset_current + idx_current * D_emb + 0],  // 写到 UVM
+        &lxu_cache_weights[cache_set * kWarpSize + insert_slot][0], // 从 HBM 读
+        D_current,
+        stochastic_rounding,
+        ...)
+        .warp_cache_evict(blockDim.x, threadIdx.x);
+}
+
+// 步骤 2: 然后把新行从 UVM 拉到 HBM
+WeightRow<emb_t, cache_t, cache_t>(
+    &weights[weights_offset_insert + idx_insert * D_emb + 0],        // 从 UVM 读
+    &lxu_cache_weights[cache_set * kWarpSize + insert_slot][0],    // 写到 HBM
+    D_insert)
+    .warp_cache_load(blockDim.x, threadIdx.x);
+
+// 步骤 3: 更新 LRU 元数据
+if (threadIdx.x == 0) {
+    lxu_cache_state[cache_set][insert_slot] = insert_idx;
+    lru_state[cache_set][insert_slot] = time_stamp;
+}
+```
+
+**重要细节**：
+- 步骤 1 和 2 是**成对**的：先 evict 旧行回 UVM，再 load 新行到 HBM
+- 步骤 3 才更新元数据（`lxu_cache_state` 记录这槽位现在存的是哪一行）
+- **元数据是 FBGEMM 自己的**（`lxu_cache_state` + `lru_state`），**不依赖 driver**
+
+#### 训练时的双向同步（更复杂）
+
+训练场景下，**optimizer 更新权重**时必须**同时写 UVM 和 HBM cache**，否则两个副本会不一致：
+
+| 同步路径 | 时机 | 代码 |
+|---|---|---|
+| **optimizer 写 HBM cache slot** | forward + backward 之间 | `split_embedding_optimizer.cu` |
+| **optimizer 写 UVM（CPU 内存）** | 同上 | 同上 |
+| **writeback 路径** | 必要时（eviction） | `warp_cache_evict` |
+
+如果 FBGEMM 只写 HBM cache 不写 UVM，cache evict 时会把**陈旧数据**写回 UVM，导致 embedding 表"丢更新"。
+
+这就是为什么在 [embedding_inplace_update.cu:84-98](fbgemm_gpu/src/embedding_inplace_ops/embedding_inplace_update.cu#L84) 中 `MANAGED_CACHING` 模式有**双写逻辑**——同时更新两份。
+
+#### 物理位置严格分离（关键事实）
+
+| 内存区域 | 物理位置 | 不可能出现的位置 | 原因 |
+|---|---|---|---|
+| `weights_uvm`（100GB） | CPU 内存 | HBM | `SetPreferredLocation=CPU` 引导 driver 不放 HBM |
+| `lxu_cache_weights`（20GB） | HBM | CPU 内存 | 它是普通 CUDA tensor，driver 无 UVM 调度 |
+
+**两套内存物理上完全分离**——这意味着：
+- 训练时 HBM cache 满不会触发 UVM driver 的 LRU 调度（因为 cache 不是 UVM）
+- UVM 大表抖动不会污染 HBM cache（因为 cache 不走 UVM 路径）
+- **HBM 总占用被 FBGEMM 显式锁死在 20GB 附近**，不会随访问模式波动
+
+#### 评审会必问的 3 个尖锐问题
+
+##### Q1: "MANAGED_CACHING 是不是有双份数据？"
+
+**答：是的。但双份是 FBGEMM 显式维护的，不是 driver 隐式复制的。**
+- `weights_uvm` 在 CPU（完整表）+ `lxu_cache_weights` 在 HBM（20% 热行副本）
+- 任何时候，HBM 上有最多 20% 的行（其余 80% 不在 HBM）
+- 训练时必须双写；推理时按需 load/evict
+
+##### Q2: "HBM 和 UVM 怎么保持一致？"
+
+**答：FBGEMM 自己保证，不依赖 driver。**
+- Forward 时：cache hit 直接读 HBM；cache miss 从 UVM `warp_cache_load` 拉一行
+- Backward 时：optimizer **同时写 HBM cache slot 和 UVM**（双写）
+- Eviction 时：`warp_cache_evict` 把 HBM 修改写回 UVM
+- **没有任何 driver 介入的自动同步**
+
+##### Q3: "driver 帮你管还是 FBGEMM 自己管？"
+
+**答：FBGEMM 自己管冷热，driver 只管 UVM 那一侧的物理页放置。**
+- Driver 管：`weights_uvm` 的物理页放哪（HBM 还是 CPU）
+- FBGEMM 管：`lxu_cache_weights` 里放哪些行、什么时候换出
+
+#### 评审会"一句话核心"
+
+> "MANAGED_CACHING 模式下，`weights_uvm` 是**完整 100GB 表的 UVM tensor**（用 `SetPreferredLocation=CPU` 引导 driver 放在 CPU 内存），`lxu_cache_weights` 是**独立的 20GB 普通 CUDA tensor**（自然放 HBM），两者**不共享 UVM 关系**。HBM cache 是 weights_uvm 中**热行的行级副本**，FBGEMM 用 `warp_cache_load` / `warp_cache_evict` 显式 cudaMemcpy 维护同步——**昇腾 UVM 硬件要实现的就是 `weights_uvm` 那一侧的 lazy fault + advised placement + accessed-by 直连**，`lxu_cache_weights` 根本不走 UVM，**昇腾硬件不需要为它实现任何 UVM 语义**。"
+
+#### 修正 §3.2.7 情况 4
+
+| 之前的描述 | 更精确的描述 |
+|---|---|
+| "HBM 占用 ≈ 20 GB（HBM cache，锁死不会超）" | "HBM 占用 = 20 GB（`lxu_cache_weights`，**独立普通 CUDA tensor**，物理一定在 HBM）" |
+| "Host 占用 ≈ 100 GB（UVM 整张表 + cache 在 host 的备份，driver 实现相关）" | "Host 占用 = 100 GB（`weights_uvm` 整张表，物理一定在 CPU 内存）" |
+| （隐含）cache 可能在 host 有备份 | "**HBM cache 不会出现在 host 上**（它不是 UVM）" |
+| （隐含）UVM 可能在 HBM 有副本 | "**weights_uvm 不会出现在 HBM 上**（`SetPreferredLocation=CPU` 引导 driver 不放 HBM）" |
+| （缺失） | "**两者物理上是完全分离的两份内存**，靠 FBGEMM 显式 memcpy 同步" |
 
 ### 3.3 算子-文件对照表
 
