@@ -1341,6 +1341,79 @@ if (threadIdx.x == 0) {
 - 步骤 3 才更新元数据（`lxu_cache_state` 记录这槽位现在存的是哪一行）
 - **元数据是 FBGEMM 自己的**（`lxu_cache_state` + `lru_state`），**不依赖 driver**
 
+#### FBGEMM 实际搬运数据的方式（kernel 内 vs `cudaMemcpy` API）
+
+FBGEMM 实际搬运数据有**两种**方式，对应**不同粒度**和**不同场景**：
+
+| 维度 | 方式 A：kernel 内逐元素拷贝 | 方式 B：`cudaMemcpyAsync` API |
+|---|---|---|
+| **API** | `same_type_vector_copy`（[weight_row.cuh:354](fbgemm_gpu/include/fbgemm_gpu/utils/weight_row.cuh#L354)） | `cudaMemcpyAsync` |
+| **调用位置** | 嵌在 forward / backward kernel 里 | 独立 host 端 launch kernel |
+| **粒度** | **一行 embedding**（行级） | **整块**（按需切分） |
+| **同步性** | 异步（kernel 内并发） | 异步（CUDA stream） |
+| **使用场景** | cache miss 时按行 load/evict | 批量场景：`lxu_cache_flush` / `lxu_cache_lock_all_rows` |
+| **代表性代码** | `warp_cache_load` / `warp_cache_evict` | [lxu_cache.cu:84-145](fbgemm_gpu/src/split_embeddings_cache/lxu_cache.cu#L84) `lxu_cache_flush` |
+| **是否阻塞 host** | 不阻塞（GPU kernel 内） | 不阻塞（async + stream） |
+| **能否 overlap 计算** | ✅ 天然 overlap | ✅ 通过多 stream overlap |
+
+##### 方式 A：kernel 内逐元素拷贝（行级同步）
+
+[weight_row.cuh:346-440](fbgemm_gpu/include/fbgemm_gpu/utils/weight_row.cuh#L346) 的 `warp_cache_load` / `warp_cache_evict` 在 **CUDA kernel 内部**用向量化赋值：
+
+```cpp
+// warp_cache_load: HBM ← UVM
+same_type_vector_copy(cache_row_ + d, reinterpret_cast<const cache_t*>(row_ + d));
+
+// warp_cache_evict: UVM ← HBM
+same_type_vector_copy(reinterpret_cast<emb_t*>(row_ + d), reinterpret_cast<const cache_t*>(cache_row_ + d));
+```
+
+**为什么不直接用 `cudaMemcpy`**：
+- `cudaMemcpy` 是**整块、阻塞**的 API，**不适合**嵌入 forward/backward kernel 的**行级、并发**场景
+- kernel 内逐元素拷贝可以**和计算流水线 overlap**（prefetch 效果）
+- 行级粒度让 FBGEMM 能在一次 kernel launch 内**部分预取**（一行 load 不阻塞其他行计算）
+
+**底层语义**：和 `cudaMemcpy` 完全一样——都是把一块 GPU 可访问内存的数据搬到另一块。区别只在**触发位置**（kernel 内 vs host launch）。
+
+##### 方式 B：`cudaMemcpyAsync` API（批量同步）
+
+[lxu_cache.cu:84-145](fbgemm_gpu/src/split_embeddings_cache/lxu_cache.cu#L84) 的 `lxu_cache_flush` 是**真正用 `cudaMemcpyAsync` API** 的代表性场景——把整个 HBM cache 一次性写回 UVM：
+
+```cpp
+// lxu_cache_flush 简化伪代码
+for (auto slot_idx = 0; slot_idx < num_slots; slot_idx++) {
+    if (lxu_cache_state[slot_idx] != kCacheStateInvalid) {
+        // 取出该槽位对应的 UVM 行号
+        auto uvm_row = lxu_cache_state[slot_idx];
+        // 计算 UVM 偏移和 HBM 偏移
+        auto hbm_offset = slot_idx * row_size;
+        auto uvm_offset = uvm_row * row_size;
+        // 显式 cudaMemcpyAsync
+        cudaMemcpyAsync(
+            weights_uvm.data_ptr<float>() + uvm_offset,   // dst: UVM (managed 指针)
+            lxu_cache_weights.data_ptr<float>() + hbm_offset, // src: HBM (device 指针)
+            row_size * sizeof(float),
+            cudaMemcpyDeviceToDevice,  // ← 关键: managed 指针当 device 指针用
+            stream
+        );
+    }
+}
+```
+
+**`cudaMemcpy` 跨 HBM/UVM 的 4 种合法方向**：
+
+| # | 源 | 目标 | `cudaMemcpyKind` | 是否合法 |
+|---|---|---|---|---|
+| 1 | HBM（device 指针） | UVM（managed 指针） | `cudaMemcpyDeviceToDevice` | ✅ driver 透明处理 |
+| 2 | UVM（managed 指针） | HBM（device 指针） | `cudaMemcpyDeviceToDevice` | ✅ driver 透明处理 |
+| 3 | HBM | UVM | `cudaMemcpyDeviceToHost` | ✅ 走 D2H 路径 |
+| 4 | UVM | HBM | `cudaMemcpyHostToDevice` | ✅ 走 H2D 路径 |
+
+**关键事实**：
+- `cudaMallocManaged` 返回的指针**既可以当 device 指针用，又可以当 host 指针用**
+- driver **透明**处理跨位置拷贝：发不同时机可能是 DMA、可能通过 host 内存中转
+- 用户**不需要关心** UVM 物理页当前在 HBM 还是 host
+
 #### 训练时的双向同步（更复杂）
 
 训练场景下，**optimizer 更新权重**时必须**同时写 UVM 和 HBM cache**，否则两个副本会不一致：
