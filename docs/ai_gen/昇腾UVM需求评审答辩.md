@@ -12,8 +12,9 @@
 1. [需求陈述：为什么非做不可（7 点）](#一需求陈述为什么非做不可7-点)
 2. [挑战一：手动管理也能放下超大表，为什么还要 UVM？](#二挑战一手动管理也能放下超大表为什么还要-uvm)
 3. [挑战二：如果客户的稀疏表方案压根不用 UVM 呢？](#三挑战二如果客户的稀疏表方案压根不用-uvm-呢)
-4. [备用追问预案](#四备用追问预案)
-5. [一句话答辩策略总结](#五一句话答辩策略总结)
+4. [技术深挖追问预案（应对评审专家的实现细节提问）](#四技术深挖追问预案应对评审专家的实现细节提问)
+5. [备用追问预案](#五备用追问预案)
+6. [一句话答辩策略总结](#六一句话答辩策略总结)
 
 ---
 
@@ -300,7 +301,161 @@ Llama-4、Mixtral 这些 MoE 大模型，**专家权重 200+ GB，每次只激�
 
 ---
 
-## 四、备用追问预案
+## 四、技术深挖追问预案（应对评审专家的实现细节提问）
+
+**定位**：前两章应对的是"**要不要做 UVM**"的战略决策问题；本章应对评审专家（懂 GPU/UVM 的技术评委）深挖"**FBGEMM 到底怎么用 UVM、昇腾要实现到什么程度**"的实现细节问题。这类问题答不好，评委会质疑工作量估算和落地可行性。所有结论均来自 [FBGEMM_UVM分析报告.md](FBGEMM_UVM分析报告.md) §3.2.6–§3.2.9 的源码审计，可追溯。
+
+### 追问 1：UVM 申请 100GB、HBM 只有 80GB，HBM 和 Host 到底各占多少？会不会把 HBM 打满？
+
+**挑战本质**：评委想验证你对 UVM 物理分配机制的理解，并质疑"UVM 会不会把 HBM 打满、和其他显存抢资源、甚至 OOM"。
+
+**第 1 层：申请瞬间——什么都不占**
+
+`cudaMallocManaged(100GB)` 只**预留虚拟地址**，**不分配物理页**：
+
+| 项 | 状态 |
+|---|---|
+| 虚拟地址空间 | 100 GB（已预留） |
+| **HBM 物理占用** | **0 GB** |
+| **Host 物理占用** | **0 GB** |
+
+对照：`cudaMalloc(100GB)` 在 80GB HBM 上**直接 OOM**；`cudaMallocManaged(100GB)` **成功**。这正是 UVM 能放下超大表而 cudaMalloc 不能的根本原因。
+
+**第 2 层：访问时——page fault 按页 lazy 分配，去向由 advise 决定**
+
+物理页按 4KB/2MB 页粒度、在**第一次访问**时由 driver 分配，去向取决于 FBGEMM 设的 advise（详见 [分析报告 §3.2.7](FBGEMM_UVM分析报告.md)）：
+
+| 触发（FBGEMM 默认 advise 下） | 物理页去向 |
+|---|---|
+| CPU 读写 | Host |
+| GPU 读 | Host（zero-copy，**不占 HBM**） |
+| GPU 写 | HBM（按需 fault 上来） |
+
+**第 3 层：MANAGED_CACHING 下——HBM 被显式锁死，不会打满**
+
+| 区域 | 物理位置 | 容量 | 占 HBM？ |
+|---|---|---|---|
+| `weights_uvm`（完整表） | Host 内存 | 100 GB | 否（`SetPreferredLocation=CPU`） |
+| `lxu_cache_weights`（热行副本） | HBM | 20 GB（`cache_load_factor=0.2`） | 是，**锁死** |
+
+HBM 占用被 `cache_load_factor=0.2` **显式锁死在 20GB**，**不随表增长而打满**，也**不和其他显存抢资源**。
+
+**一句话答辩**：
+> "`cudaMallocManaged(100GB)` 申请瞬间 HBM 和 Host 都是 **0**——只预留虚拟地址，物理页按访问 lazy 分配。FBGEMM 的 MANAGED_CACHING 模式下，完整 100GB 表用 `SetPreferredLocation=CPU` 放 Host，HBM 只放一个 20GB 的独立 cache tensor，容量被 `cache_load_factor=0.2` 显式锁死，**不会把 HBM 打满，也不会 OOM**。UVM 不是'把 HBM 当溢出'，是'让 HBM 只装该装的热数据'。"
+
+### 追问 2：FBGEMM 实际用了哪些 UVM advise？昇腾硬件最小要支持哪些？
+
+**挑战本质**：评委想量化"昇腾 UVM 要实现多少语义才算够"，质疑工作量和实现范围是否可控。
+
+**第 1 层：穷举——FBGEMM 只硬编码 2 个 advise**
+
+源码审计 `new_managed_tensor`（[memory_utils.cu:202-227](fbgemm_gpu/src/memory_utils/memory_utils.cu#L202)），全部 `cudaMemAdvise` 调用点中**硬编码的只有 2 个**：
+
+| advise | 值 | 作用 |
+|---|---|---|
+| `SetPreferredLocation` | CPU | 引导 driver 把表放 Host |
+| `SetAccessedBy` | GPU | GPU 读走 zero-copy 不 fault |
+
+再加 **1 个 OS 兼容性调用**：`madvise(MADV_DONTFORK)`（处理 fork，**不是 CUDA advise**）。
+
+**第 2 层：HBM cache 不走 UVM，零 advise**
+
+`lxu_cache_weights` 是 `at::empty` 分配的**普通 CUDA tensor**（[lxu_cache.cu:415, 472](fbgemm_gpu/src/split_embeddings_cache/lxu_cache.cu#L415)），**不是 UVM，不调任何 advise**——driver 看到普通 device tensor 自然放 HBM。UVM 的实现范围**只覆盖 `weights_uvm` 那一侧**。
+
+**第 3 层：其余 advise 都是"暴露但不用"**
+
+FBGEMM 把 6 种 advise（3 set + 3 unset）注册到 Python enum 暴露给用户，但**内部 C++ 只用上面 2 个**。`SetReadMostly` / `SetPreferredLocation=DEVICE` 等都不用（表要训练会被写，ReadMostly 反而引发多余迁移）。
+
+| 类别 | 接口 | 首期是否必须 |
+|---|---|---|
+| `SetPreferredLocation`（→CPU） | 引导 placement | ✅ 必须 |
+| `SetAccessedBy`（→GPU） | 读零拷贝 | ✅ 必须 |
+| `madvise(MADV_DONTFORK)` | fork 兼容 | ✅ 必须 |
+| 其余 4 种 advise | — | ❌ 首期可不实现 |
+
+**一句话答辩**：
+> "源码穷举下来，FBGEMM 硬编码的 UVM advise 就 **2 个**：`SetPreferredLocation=CPU` + `SetAccessedBy=GPU`，加 1 个 OS 的 `madvise(DONTFORK)`。HBM cache 是普通 CUDA tensor，不走 UVM、零 advise。**昇腾 UVM 首期要实现的最小 advise 集合就这 3 个**，其余 4 种 FBGEMM 根本不用。范围非常收敛，不是要实现整套 CUDA UVM 语义。"
+
+### 追问 3：MANAGED_CACHING 数据存了两份？HBM 和 UVM 怎么保持一致？谁管一致性？
+
+**挑战本质**：这是评委最可能深挖的"经典难题"——双份数据一致性。想看 FBGEMM 怎么解决，进而质疑昇腾能不能扛住。
+
+**第 1 层：先澄清——不是"UVM 的两份页副本"，是"两个独立 tensor"**
+
+| 对比 | UVM driver 的页副本 | FBGEMM 的 HBM cache |
+|---|---|---|
+| 形态 | 同一 UVM tensor 的页 | **两个独立 tensor** |
+| 同步 | driver 自动 | **FBGEMM 显式 memcpy** |
+| 粒度 | 4KB/2MB 页 | **一行 embedding** |
+
+- `weights_uvm`：`cudaMallocManaged` 的完整 100GB 表，物理在 Host
+- `lxu_cache_weights`：`at::empty` 的独立 20GB 普通 CUDA tensor，物理在 HBM
+- **两者没有 UVM 关系**，是两份独立内存（详见 [分析报告 §3.2.9](FBGEMM_UVM分析报告.md)）
+
+**第 2 层：一致性靠 FBGEMM 显式 memcpy，不靠 driver**
+
+两个原语（[weight_row.cuh:346-440](fbgemm_gpu/include/fbgemm_gpu/utils/weight_row.cuh#L346)）：
+- `warp_cache_load`：cache miss 时，**一行**从 UVM 拷到 HBM（热行上行）
+- `warp_cache_evict`：cache 满时，**一行**从 HBM 写回 UVM（冷行下行）
+
+替换策略由 FBGEMM 自己的元数据（`lxu_cache_state` + `lru_state` 时间戳）决定，**完全不依赖 UVM driver 的 LRU**。
+
+**第 3 层：训练时双写保证不"丢更新"**
+
+权重更新（optimizer / `embedding_inplace_update`）时，FBGEMM **同时写 HBM cache slot 和 UVM 主存**。只写 cache 不写 UVM，evict 时会把陈旧数据写回，导致梯度错误——这个双写是 Meta 踩坑沉淀的工程。
+
+**一句话答辩**：
+> "MANAGED_CACHING 确实是两份数据，但**不是 UVM driver 管的两份页副本**，是**两个独立 tensor**：完整表 `weights_uvm` 在 Host，热行副本 `lxu_cache_weights` 在 HBM。一致性 **FBGEMM 自己用显式 memcpy 管**——`warp_cache_load` 上行、`warp_cache_evict` 下行，粒度是一行，替换策略靠 FBGEMM 自己的 LRU 时间戳，**不依赖 driver**。训练时双写保证不丢更新。**昇腾 UVM 只要把 `weights_uvm` 那一侧的语义实现对就行，一致性的活 FBGEMM 自己干了，不增加昇腾负担**。"
+
+### 追问 4：那搬运具体用什么 API？纯 kernel 内拷贝够吗，要不要 cudaMemcpy？
+
+**挑战本质**：评委想看具体实现路径，质疑昇腾 CANN 的接口够不够支撑。
+
+**第 1 层：两种方式，对应不同场景**
+
+| 方式 | API | 粒度 | 场景 |
+|---|---|---|---|
+| A：kernel 内逐元素拷贝 | `same_type_vector_copy` | **一行** | forward/backward 内的 cache load/evict |
+| B：`cudaMemcpyAsync` | CANN `aclrtMemcpyAsync` | **整块** | `lxu_cache_flush`（整个 cache 写回） |
+
+方式 A 嵌在 kernel 里，能和计算流水 overlap；方式 B 是独立 launch，用于批量场景。**底层语义相同**——都是 GPU 可访内存间的数据搬运（详见 [分析报告 §3.2.9](FBGEMM_UVM分析报告.md)）。
+
+**第 2 层：cudaMallocManaged 指针的"双面性"是关键**
+
+`cudaMallocManaged` 返回的指针**既可以当 device 指针、又可以当 host 指针**。跨 HBM/UVM 的拷贝 driver **透明处理**，4 个方向都合法（HBM↔UVM 用 D2D / D2H / H2D 均可），用户不用关心 UVM 物理页当前在哪。
+
+**第 3 层：昇腾 CANN 的接口够用**
+
+MANAGED_CACHING 首期只需要：
+
+| CANN 接口 | 用途 |
+|---|---|
+| `aclrtMallocManaged` | 分配 |
+| `aclrtMemcpyAsync` | 搬运 |
+| 2 个 `aclrtMemAdvise` | placement + accessed-by |
+
+**不需要硬件 page-fault**——因为搬运是 FBGEMM **显式触发**的，不是 driver fault 驱动的。
+
+**一句话答辩**：
+> "搬运两种方式：行级用 kernel 内逐元素拷贝（和计算 overlap），整块用 `cudaMemcpyAsync`。关键在 `cudaMallocManaged` 的指针既能当 device 又能当 host 用，driver 透明处理跨位置拷贝。**昇腾 CANN 只要 `aclrtMallocManaged` + `aclrtMemcpyAsync` + 2 个 advise 就能跑通 MANAGED_CACHING**，首期甚至不依赖硬件 page-fault——搬运是 FBGEMM 显式触发的，不是 fault 驱动的。"
+
+### 追问 5（衔接）：既然 FBGEMM 自己管搬运，纯 cudaMalloc 不够吗，为什么非要 UVM？
+
+**挑战本质**：评委顺着一追到底的终极问题——既然搬运、一致性、LRU 全是 FBGEMM 自己干，UVM 到底提供了什么不可替代的东西？
+
+**一句话答**（详见 [分析报告 §3.2.6](FBGEMM_UVM分析报告.md)）：UVM 提供的不是"自动搬运"，是**统一虚拟地址空间**这个底层抽象。FBGEMM 借它实现 **4 件纯 cudaMalloc 做不到**的事：
+
+1. **CPU/GPU 共享同一指针**（优化器 state + `get_maybe_uvm_scalar` 直接 deref）
+2. **tensor 零拷贝切换 device 视角**（`uvm_to_cpu` / `uvm_to_device`）
+3. **超量分配**（200GB 表在 80GB HBM 上不 OOM）
+4. **跨进程 fork 传递**
+
+**一句话答辩**：
+> "FBGEMM 自己管搬运不假，但**前提是有'统一地址空间'这个地基**。纯 cudaMalloc 没有这个地基——CPU/GPU 指针不通用、超量分配就 OOM、跨进程直接失效。UVM 给的是地基，FBGEMM 在地基上盖的 cache / LRU / 双写是上层建筑。砍掉地基，上层建筑全部塌。"
+
+---
+
+## 五、备用追问预案
 
 ### 挑战一的备用追问
 
@@ -326,7 +481,7 @@ Llama-4、Mixtral 这些 MoE 大模型，**专家权重 200+ GB，每次只激�
 
 ---
 
-## 五、一句话答辩策略总结
+## 六、一句话答辩策略总结
 
 **核心原则：不要争"UVM 必需"，要争"UVM 是低投入、不对称收益、风险在不做的需求"**。
 
@@ -354,6 +509,20 @@ Llama-4、Mixtral 这些 MoE 大模型，**专家权重 200+ GB，每次只激�
 | 翻转 | 重新定义问题框架 | 把战场拉到我方优势区 |
 | 论证 | 算账 + 客户分层 + 数据 | 用事实支撑 |
 | 收尾 | 反问/不对称收益 | 把举证责任转回去 |
+
+### 应对技术深挖追问的核心原则（第四章）
+
+技术追问（第四章）和前两个战略挑战的答题逻辑**不同**：战略挑战争的是"要不要做"，技术追问争的是"**实现范围可不可控、能不能落地**"。核心策略是用**源码事实把范围量化到最小**，把不可控的部分推后。
+
+| 原则 | 含义 | 对应追问 |
+|---|---|---|
+| **用源码事实量化范围** | 不空谈"要实现 UVM"，而是说清"就 2 个 advise + 1 个文件 + 8 个 API" | 追问 2 |
+| **把不可控推到二期** | 硬件 page-fault 是唯一不可控项，明确推到二期；一期 MANAGED_CACHING 软件层就能交付 | 追问 1、4 |
+| **划清职责边界** | 一致性、LRU、双写都是 FBGEMM 自己干的，**不增加昇腾负担**——昇腾只管"统一地址空间 + managed 指针" | 追问 3 |
+| **回到"地基 vs 上层建筑"** | 被追到"那为什么非要 UVM"时，用统一地址空间的 4 个不可替代能力收口 | 追问 5 |
+
+**一句话收口**：
+> "技术追问的所有答案都指向同一个结论——**昇腾 UVM 的实现范围非常小且可控**：最小 advise 集合 3 个、接口面 8 个 CUDA API、集中在 1 个 440 行文件，一期 MANAGED_CACHING 不卡硬件 page-fault，一致性/LRU/双写 FBGEMM 自己兜底。这不是一个'要重新造 UVM'的需求，是一个'在一个明确的适配层做对等实现'的需求。"
 
 ---
 
